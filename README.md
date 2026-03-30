@@ -325,6 +325,14 @@ printf '%s\n' 10.1126/science.1157784 10.1038/nphys1170 | ./crossref-csl bibliog
 printf '%s\n' 10.1126/science.1157784 10.1038/nphys1170 | ./doi-pdf --source 'https://example.org/'
 ```
 
+批量下载和并发：
+
+```bash
+./doi-pdf --source 'https://example.org/{doi}' 10.1126/science.1157784 10.1038/nphys1170
+./doi-pdf --source 'https://example.org/{doi}' --concurrency 2 10.1126/science.1157784 10.1038/nphys1170
+printf '%s\n' 10.1126/science.1157784 10.1038/nphys1170 | ./doi-pdf --source 'https://example.org/{doi}'
+```
+
 配置文件：
 
 ```json
@@ -389,6 +397,9 @@ printf '%s\n' 10.1126/science.1157784 10.1038/nphys1170 | ./doi-pdf --source 'ht
 - 如果 `source` 不含占位符，行为就是 `source + DOI`
 - 默认输出目录是当前目录下的 `papers`
 - 默认并发是 `3`，最大也是 `3`
+- 支持多个 DOI 批量下载，既可以作为位置参数传入，也可以从 `stdin` 读入
+- 内部使用小并发队列处理批量下载，不会一次性把所有 DOI 全部并发发出
+- 如果输入 50 个 DOI，最多同时跑 `3` 个下载任务，完成一个再补下一个
 - 下载源返回的内容需要满足以下任一条件：
   - 直接返回 PDF
   - HTML 中包含 `citation_pdf_url`
