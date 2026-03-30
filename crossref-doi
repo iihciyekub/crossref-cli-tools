@@ -3,25 +3,32 @@
 set -euo pipefail
 
 USER_AGENT="crossref-doi-shell/0.1.0"
+VERSION="0.1.0"
 DOI_BASE_URL="https://doi.org"
 CROSSREF_API_BASE_URL="https://api.crossref.org"
+CURL_RETRIES="${CROSSREFCLI_RETRIES:-2}"
+CURL_CONNECT_TIMEOUT="${CROSSREFCLI_CONNECT_TIMEOUT:-10}"
+CURL_MAX_TIME="${CROSSREFCLI_MAX_TIME:-60}"
 
 usage() {
   cat <<'EOF'
 Usage:
-  crossref-doi [options] DOI
-  crossref-doi --doi DOI --format text --style apa
+  crossref-doi [options] DOI...
+  crossref-doi --doi DOI --doi DOI --format text --style apa
+  printf '%s\n' DOI DOI | crossref-doi
   crossref-doi --list-styles
 
 Options:
-  --doi DOI        DOI to retrieve
+  --doi DOI        DOI to retrieve, can be repeated
   --format NAME    text | bibtex | ris | csljson | json | unixref | unixsd
                    Default: text
   --style NAME     CSL style for --format text. Default: apa
   --locale NAME    Locale for --format text. Default: en-US
+  --out DIR        Save each DOI result as a separate file in DIR
   --search-style K Search supported CSL style names by keyword
   --show-styles N  Show the first N CSL style names
   --list-styles    Print supported CSL style names from Crossref
+  --version        Show version
   -h, --help       Show this help
 EOF
 }
@@ -38,6 +45,15 @@ trim() {
   value="${value#"${value%%[![:space:]]*}"}"
   value="${value%"${value##*[![:space:]]}"}"
   printf '%s' "$value"
+}
+
+read_dois_from_stdin() {
+  perl -ne '
+    s/\r?\n$//;
+    s/^\s+//;
+    s/\s+$//;
+    print "$_\n" if length $_;
+  '
 }
 
 urlencode() {
@@ -57,12 +73,49 @@ urlencode() {
   ' "$1"
 }
 
+sanitize_filename() {
+  perl -e '
+    use strict;
+    use warnings;
+    my $value = shift // q{};
+    $value =~ s{[\/\\:\*\?"<>\|]}{_}g;
+    $value =~ s/\s+/_/g;
+    $value =~ s/_+/_/g;
+    $value =~ s/^_+//;
+    $value =~ s/_+$//;
+    print length($value) ? $value : "item";
+  ' "$1"
+}
+
+file_extension_for_format() {
+  case "$1" in
+    text) printf 'txt' ;;
+    bibtex) printf 'bib' ;;
+    ris) printf 'ris' ;;
+    csljson) printf 'csl.json' ;;
+    json) printf 'json' ;;
+    unixref) printf 'unixref.xml' ;;
+    unixsd) printf 'unixsd.xml' ;;
+    *) printf 'out' ;;
+  esac
+}
+
 main() {
   need_cmd curl
   need_cmd perl
 
+  local -a curl_common_args
+  curl_common_args=(
+    -sSL
+    --retry "$CURL_RETRIES"
+    --retry-all-errors
+    --connect-timeout "$CURL_CONNECT_TIMEOUT"
+    --max-time "$CURL_MAX_TIME"
+    -A "$USER_AGENT"
+  )
+
   list_styles_from_api() {
-    curl -sSL -A "$USER_AGENT" \
+    curl "${curl_common_args[@]}" \
       "${CROSSREF_API_BASE_URL}/v1/styles" \
       | perl -0ne '
           use strict;
@@ -75,10 +128,101 @@ main() {
         '
   }
 
-  local doi=""
+  fetch_one() {
+    local url="$1"
+    local accept_header="${2:-}"
+
+    if [[ -n "$accept_header" ]]; then
+      curl "${curl_common_args[@]}" \
+        -H "Accept: ${accept_header}" \
+        "$url"
+    else
+      curl "${curl_common_args[@]}" "$url"
+    fi
+  }
+
+  ensure_valid_style() {
+    local requested_style="$1"
+    local style_check
+
+    style_check="$(
+      list_styles_from_api | perl -e '
+        use strict;
+        use warnings;
+
+        my $needle = lc(shift // q{});
+        my @items = <STDIN>;
+        chomp @items;
+
+        sub distance {
+          my ($a, $b) = @_;
+          my @a = split //, $a;
+          my @b = split //, $b;
+          my @d;
+          $d[$_][0] = $_ for 0 .. @a;
+          $d[0][$_] = $_ for 0 .. @b;
+          for my $i (1 .. @a) {
+            for my $j (1 .. @b) {
+              my $cost = ($a[$i - 1] eq $b[$j - 1]) ? 0 : 1;
+              my $del = $d[$i - 1][$j] + 1;
+              my $ins = $d[$i][$j - 1] + 1;
+              my $sub = $d[$i - 1][$j - 1] + $cost;
+              my $min = $del < $ins ? $del : $ins;
+              $min = $sub if $sub < $min;
+              $d[$i][$j] = $min;
+            }
+          }
+          return $d[@a][@b];
+        }
+
+        my %seen;
+        my @exact = grep { lc($_) eq $needle } @items;
+        if (@exact) {
+          print "OK\n";
+          exit 0;
+        }
+
+        my @contains = grep { index(lc($_), $needle) >= 0 } @items;
+        my @ranked = sort {
+          distance(lc($a), $needle) <=> distance(lc($b), $needle) || $a cmp $b
+        } @items;
+        my @suggestions = ();
+        for my $item (@contains, @ranked) {
+          next if $seen{$item}++;
+          push @suggestions, $item;
+          last if @suggestions >= 5;
+        }
+
+        print "MISS\n";
+        print "$_\n" for @suggestions;
+      ' "$requested_style"
+    )"
+
+    if [[ "${style_check%%$'\n'*}" == "OK" ]]; then
+      return 0
+    fi
+
+    {
+      printf 'Unknown CSL style: %s\n' "$requested_style"
+      local suggestions="${style_check#*$'\n'}"
+      if [[ -n "$suggestions" && "$suggestions" != "$style_check" ]]; then
+        printf 'Did you mean:\n'
+        while IFS= read -r line; do
+          [[ -z "$line" ]] && continue
+          printf '  - %s\n' "$line"
+        done <<< "$suggestions"
+      else
+        printf 'Use --list-styles or --search-style to inspect available styles.\n'
+      fi
+    } >&2
+    exit 1
+  }
+
+  local -a dois=()
   local format="text"
   local style="apa"
   local locale="en-US"
+  local out_dir=""
   local list_styles=0
   local search_style=""
   local show_styles=""
@@ -86,11 +230,12 @@ main() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --doi)
-        doi="${2:-}"
-        if [[ -z "$doi" ]]; then
+        local one_doi="${2:-}"
+        if [[ -z "$one_doi" ]]; then
           echo "--doi requires a value" >&2
           exit 1
         fi
+        dois+=("$one_doi")
         shift 2
         ;;
       --format)
@@ -117,6 +262,14 @@ main() {
         fi
         shift 2
         ;;
+      --out)
+        out_dir="${2:-}"
+        if [[ -z "$out_dir" ]]; then
+          echo "--out requires a value" >&2
+          exit 1
+        fi
+        shift 2
+        ;;
       --list-styles)
         list_styles=1
         shift
@@ -137,6 +290,10 @@ main() {
         fi
         shift 2
         ;;
+      --version)
+        printf '%s\n' "$VERSION"
+        exit 0
+        ;;
       -h|--help)
         usage
         exit 0
@@ -146,11 +303,7 @@ main() {
         exit 1
         ;;
       *)
-        if [[ -n "$doi" ]]; then
-          echo "Only one DOI is supported" >&2
-          exit 1
-        fi
-        doi="$1"
+        dois+=("$1")
         shift
         ;;
     esac
@@ -175,58 +328,135 @@ main() {
     exit 0
   fi
 
-  doi="$(trim "$doi")"
-  if [[ -z "$doi" ]]; then
-    echo "No DOI provided. Pass a DOI or use --list-styles." >&2
+  if [[ "${#dois[@]}" -eq 0 && ! -t 0 ]]; then
+    while IFS= read -r line; do
+      dois+=("$line")
+    done < <(read_dois_from_stdin)
+  fi
+
+  local -a final_dois=()
+  local item
+  for item in "${dois[@]}"; do
+    item="$(trim "$item")"
+    [[ -z "$item" ]] && continue
+    final_dois+=("$item")
+  done
+
+  if [[ "${#final_dois[@]}" -eq 0 ]]; then
+    echo "No DOI provided. Pass one or more DOIs, or pipe DOI lines on stdin." >&2
     exit 1
   fi
 
-  local accept_header=""
-  local url=""
-  local encoded_doi
-  encoded_doi="$(urlencode "$doi")"
+  if [[ "$format" == "text" ]]; then
+    ensure_valid_style "$style"
+  fi
 
-  case "$format" in
-    text)
-      accept_header="text/x-bibliography; style=${style}; locale=${locale}"
-      url="${DOI_BASE_URL}/${encoded_doi}"
-      ;;
-    bibtex)
-      accept_header="application/x-bibtex"
-      url="${DOI_BASE_URL}/${encoded_doi}"
-      ;;
-    ris)
-      accept_header="application/x-research-info-systems"
-      url="${DOI_BASE_URL}/${encoded_doi}"
-      ;;
-    csljson)
-      accept_header="application/vnd.citationstyles.csl+json"
-      url="${DOI_BASE_URL}/${encoded_doi}"
-      ;;
-    unixref)
-      accept_header="application/vnd.crossref.unixref+xml"
-      url="${DOI_BASE_URL}/${encoded_doi}"
-      ;;
-    unixsd)
-      accept_header="application/vnd.crossref.unixsd+xml"
-      url="${DOI_BASE_URL}/${encoded_doi}"
-      ;;
-    json)
-      url="${CROSSREF_API_BASE_URL}/works/${encoded_doi}"
-      ;;
-    *)
-      echo "Unsupported format: $format" >&2
-      echo "Supported formats: text, bibtex, ris, csljson, json, unixref, unixsd" >&2
-      exit 1
-      ;;
-  esac
+  if [[ -n "$out_dir" ]]; then
+    mkdir -p "$out_dir"
+  fi
 
-  if [[ -n "$accept_header" ]]; then
-    curl -sSL -A "$USER_AGENT" \
-      -H "Accept: ${accept_header}" \
-      "$url"
-  else
-    curl -sSL -A "$USER_AGENT" "$url"
+  local tmpdir=""
+  if [[ "$format" == "json" || "$format" == "csljson" ]]; then
+    tmpdir="$(mktemp -d)"
+    trap 'rm -rf "${tmpdir:-}"' EXIT
+  fi
+
+  local idx=0
+  local total="${#final_dois[@]}"
+  local doi encoded_doi accept_header url out_file output_file extension
+  for doi in "${final_dois[@]}"; do
+    encoded_doi="$(urlencode "$doi")"
+    case "$format" in
+      text)
+        accept_header="text/x-bibliography; style=${style}; locale=${locale}"
+        url="${DOI_BASE_URL}/${encoded_doi}"
+        ;;
+      bibtex)
+        accept_header="application/x-bibtex"
+        url="${DOI_BASE_URL}/${encoded_doi}"
+        ;;
+      ris)
+        accept_header="application/x-research-info-systems"
+        url="${DOI_BASE_URL}/${encoded_doi}"
+        ;;
+      csljson)
+        accept_header="application/vnd.citationstyles.csl+json"
+        url="${DOI_BASE_URL}/${encoded_doi}"
+        ;;
+      unixref)
+        accept_header="application/vnd.crossref.unixref+xml"
+        url="${DOI_BASE_URL}/${encoded_doi}"
+        ;;
+      unixsd)
+        accept_header="application/vnd.crossref.unixsd+xml"
+        url="${DOI_BASE_URL}/${encoded_doi}"
+        ;;
+      json)
+        accept_header=""
+        url="${CROSSREF_API_BASE_URL}/works/${encoded_doi}"
+        ;;
+      *)
+        echo "Unsupported format: $format" >&2
+        echo "Supported formats: text, bibtex, ris, csljson, json, unixref, unixsd" >&2
+        exit 1
+        ;;
+    esac
+
+    if [[ "$format" == "json" || "$format" == "csljson" ]]; then
+      out_file="$tmpdir/$idx.json"
+      fetch_one "$url" "$accept_header" > "$out_file"
+      if [[ -n "$out_dir" ]]; then
+        extension="$(file_extension_for_format "$format")"
+        output_file="$out_dir/$(sanitize_filename "$doi").$extension"
+        cp "$out_file" "$output_file"
+      fi
+    else
+      if [[ -n "$out_dir" ]]; then
+        extension="$(file_extension_for_format "$format")"
+        output_file="$out_dir/$(sanitize_filename "$doi").$extension"
+        fetch_one "$url" "$accept_header" > "$output_file"
+      else
+        fetch_one "$url" "$accept_header"
+        if [[ "$idx" -lt $((total - 1)) ]]; then
+          printf '\n'
+          if [[ "$format" != "text" ]]; then
+            printf '\n'
+          fi
+        fi
+      fi
+    fi
+    idx=$((idx + 1))
+  done
+
+  if [[ "$format" == "json" || "$format" == "csljson" ]]; then
+    if [[ -z "$out_dir" ]]; then
+      if [[ "$total" -eq 1 ]]; then
+        cat "$tmpdir/0.json"
+      else
+        perl -MJSON::PP -e '
+          use strict;
+          use warnings;
+          my @files = @ARGV;
+          my @items;
+          for my $file (@files) {
+            open my $fh, "<", $file or die "Unable to read $file: $!";
+            local $/;
+            my $content = <$fh>;
+            close $fh;
+            push @items, decode_json($content);
+          }
+          print JSON::PP->new->utf8->pretty->encode(\@items);
+        ' "$tmpdir"/*.json
+      fi
+    fi
+  fi
+
+  if [[ -n "$out_dir" ]]; then
+    if [[ "$total" -eq 1 ]]; then
+      printf 'Saved 1 file to %s\n' "$out_dir" >&2
+    else
+      printf 'Saved %s files to %s\n' "$total" "$out_dir" >&2
+    fi
   fi
 }
 

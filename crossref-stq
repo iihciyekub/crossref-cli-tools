@@ -4,6 +4,10 @@ set -euo pipefail
 
 BASE_URL="https://apps.crossref.org/SimpleTextQuery"
 USER_AGENT="crossref-stq-shell/0.1.0"
+VERSION="0.1.0"
+CURL_RETRIES="${CROSSREFCLI_RETRIES:-2}"
+CURL_CONNECT_TIMEOUT="${CROSSREFCLI_CONNECT_TIMEOUT:-10}"
+CURL_MAX_TIME="${CROSSREFCLI_MAX_TIME:-60}"
 
 usage() {
   cat <<'EOF'
@@ -19,6 +23,7 @@ Options:
   --multi-hit     Ask Crossref to return all DOI candidates
   --verbose       Print reference details instead of DOI-only output
   --json          Print JSON
+  --version       Show version
   -h, --help      Show this help
 EOF
 }
@@ -71,6 +76,16 @@ main() {
   local verbose_output=0
   local json_output=0
   local file_arg=""
+  local -a curl_common_args
+
+  curl_common_args=(
+    -sS
+    --retry "$CURL_RETRIES"
+    --retry-all-errors
+    --connect-timeout "$CURL_CONNECT_TIMEOUT"
+    --max-time "$CURL_MAX_TIME"
+    -A "$USER_AGENT"
+  )
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -101,6 +116,10 @@ main() {
       --verbose)
         verbose_output=1
         shift
+        ;;
+      --version)
+        printf '%s\n' "$VERSION"
+        exit 0
         ;;
       -h|--help)
         usage
@@ -142,8 +161,8 @@ main() {
 
   printf '%s' "$input_text" > "$input_file"
 
-  curl -sS \
-    -A "$USER_AGENT" \
+  curl \
+    "${curl_common_args[@]}" \
     -c "$cookie_file" \
     "$BASE_URL" > "$page_file"
 
@@ -159,8 +178,7 @@ main() {
 
   local -a curl_args
   curl_args=(
-    -sS
-    -A "$USER_AGENT"
+    "${curl_common_args[@]}"
     -b "$cookie_file"
     -c "$cookie_file"
     -X POST "$BASE_URL"

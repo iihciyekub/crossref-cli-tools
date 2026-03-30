@@ -2,18 +2,19 @@
 
 "use strict";
 
-const fs = require("node:fs");
 const fsp = require("node:fs/promises");
 const os = require("node:os");
 const path = require("node:path");
 const process = require("node:process");
 const CSL = require("citeproc");
 
+const VERSION = "0.1.0";
 const USER_AGENT = "crossref-csl/0.1.0";
 const DOI_BASE_URL = "https://doi.org";
 const STYLES_LIST_URL = "https://api.crossref.org/v1/styles";
 const STYLE_BASE_URL = "https://raw.githubusercontent.com/citation-style-language/styles/master";
 const LOCALE_BASE_URL = "https://raw.githubusercontent.com/citation-style-language/locales/master";
+const FETCH_TIMEOUT_MS = Number.parseInt(process.env.CROSSREFCLI_FETCH_TIMEOUT_MS || "60000", 10);
 const CACHE_DIR =
   process.env.CROSSREFCLI_CACHE_DIR ||
   path.join(process.env.XDG_CACHE_HOME || path.join(os.homedir(), ".cache"), "crossref-cli");
@@ -40,9 +41,14 @@ Options:
   --style-file P   Path to a local .csl file
   --locale NAME    CSL locale. Default: en-US
   --output NAME    text | html. Default: text
+  --prefix TEXT    Citation prefix, applies to citation mode
+  --suffix TEXT    Citation suffix, applies to citation mode
+  --locator TEXT   Citation locator such as "p. 12", applies to citation mode
+  --out FILE       Save rendered output to FILE
   --search-style K Search supported CSL style names by keyword
   --show-styles N  Show the first N CSL style names
   --list-styles    Print supported CSL style names from Crossref
+  --version        Show version
   -h, --help       Show this help
 `);
 }
@@ -64,16 +70,49 @@ function encodeFilePart(value) {
   return encodeURIComponent(value).replace(/%/g, "_");
 }
 
+function levenshtein(a, b) {
+  const left = [...a];
+  const right = [...b];
+  const dp = Array.from({ length: left.length + 1 }, () => Array(right.length + 1).fill(0));
+  for (let i = 0; i <= left.length; i += 1) dp[i][0] = i;
+  for (let j = 0; j <= right.length; j += 1) dp[0][j] = j;
+  for (let i = 1; i <= left.length; i += 1) {
+    for (let j = 1; j <= right.length; j += 1) {
+      const cost = left[i - 1] === right[j - 1] ? 0 : 1;
+      dp[i][j] = Math.min(
+        dp[i - 1][j] + 1,
+        dp[i][j - 1] + 1,
+        dp[i - 1][j - 1] + cost
+      );
+    }
+  }
+  return dp[left.length][right.length];
+}
+
 async function fetchText(url, headers = {}) {
   let lastStatus = 0;
   for (let attempt = 0; attempt < 3; attempt += 1) {
-    const response = await fetch(url, {
-      headers: {
-        "User-Agent": USER_AGENT,
-        ...headers,
-      },
-      redirect: "follow",
-    });
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+    let response;
+    try {
+      response = await fetch(url, {
+        headers: {
+          "User-Agent": USER_AGENT,
+          ...headers,
+        },
+        redirect: "follow",
+        signal: controller.signal,
+      });
+    } catch (error) {
+      clearTimeout(timeoutId);
+      if (attempt === 2) {
+        throw error;
+      }
+      await sleep(500 * (attempt + 1));
+      continue;
+    }
+    clearTimeout(timeoutId);
     if (response.ok) {
       return await response.text();
     }
@@ -189,11 +228,24 @@ async function renderBibliography({ processor, itemIds, output }) {
   return entries.join("\n");
 }
 
-async function renderCitation({ processor, itemIds, output }) {
+async function renderCitation({ processor, itemIds, output, prefix, suffix, locator }) {
   processor.updateItems(itemIds);
   const citation = {
     citationID: "citation-1",
-    citationItems: itemIds.map((id) => ({ id })),
+    citationItems: itemIds.map((id) => {
+      const item = { id };
+      if (prefix) {
+        item.prefix = prefix;
+      }
+      if (suffix) {
+        item.suffix = suffix;
+      }
+      if (locator) {
+        item.label = "page";
+        item.locator = locator;
+      }
+      return item;
+    }),
     properties: {
       noteIndex: 0,
     },
@@ -206,6 +258,36 @@ async function listStyles() {
   const json = JSON.parse(payload);
   const items = json && json.message && json.message.items ? json.message.items : [];
   return items;
+}
+
+async function ensureValidStyle(styleName) {
+  const items = await listStyles();
+  const requested = styleName.toLowerCase();
+  if (items.some((item) => item.toLowerCase() === requested)) {
+    return;
+  }
+
+  const contains = items.filter((item) => item.toLowerCase().includes(requested));
+  const ranked = [...items].sort(
+    (a, b) => levenshtein(a.toLowerCase(), requested) - levenshtein(b.toLowerCase(), requested) || a.localeCompare(b)
+  );
+  const suggestions = [];
+  for (const item of [...contains, ...ranked]) {
+    if (!suggestions.includes(item)) {
+      suggestions.push(item);
+    }
+    if (suggestions.length >= 5) {
+      break;
+    }
+  }
+
+  let message = `Unknown CSL style: ${styleName}`;
+  if (suggestions.length > 0) {
+    message += `\nDid you mean:\n${suggestions.map((item) => `  - ${item}`).join("\n")}`;
+  } else {
+    message += "\nUse --list-styles or --search-style to inspect available styles.";
+  }
+  fail(message);
 }
 
 async function readDoisFromStdinIfNeeded(existingDois) {
@@ -230,6 +312,10 @@ async function main() {
   let styleFilePath = "";
   let locale = "en-US";
   let output = "text";
+  let prefix = "";
+  let suffix = "";
+  let locator = "";
+  let outFile = "";
   let listStylesFlag = false;
   let searchStyle = "";
   let showStyles = "";
@@ -281,9 +367,40 @@ async function main() {
         }
         index += 1;
         break;
+      case "--prefix":
+        prefix = args[index + 1] || "";
+        if (!prefix) {
+          fail("--prefix requires a value");
+        }
+        index += 1;
+        break;
+      case "--suffix":
+        suffix = args[index + 1] || "";
+        if (!suffix) {
+          fail("--suffix requires a value");
+        }
+        index += 1;
+        break;
+      case "--locator":
+        locator = args[index + 1] || "";
+        if (!locator) {
+          fail("--locator requires a value");
+        }
+        index += 1;
+        break;
+      case "--out":
+        outFile = args[index + 1] || "";
+        if (!outFile) {
+          fail("--out requires a value");
+        }
+        index += 1;
+        break;
       case "--list-styles":
         listStylesFlag = true;
         break;
+      case "--version":
+        process.stdout.write(`${VERSION}\n`);
+        return;
       case "--search-style":
         searchStyle = args[index + 1] || "";
         if (!searchStyle) {
@@ -343,6 +460,13 @@ async function main() {
   if (!["text", "html"].includes(output)) {
     fail("Unsupported output. Use text or html.");
   }
+  if (mode === "bibliography" && (prefix || suffix || locator)) {
+    fail("--prefix, --suffix, and --locator are only supported in citation mode.");
+  }
+
+  if (!styleFilePath) {
+    await ensureValidStyle(style);
+  }
 
   const finalDois = await readDoisFromStdinIfNeeded(dois);
   if (finalDois.length === 0) {
@@ -380,7 +504,14 @@ async function main() {
   const rendered =
     mode === "bibliography"
       ? await renderBibliography({ processor, itemIds: uniqueDois, output })
-      : await renderCitation({ processor, itemIds: normalizedDois, output });
+      : await renderCitation({ processor, itemIds: normalizedDois, output, prefix, suffix, locator });
+
+  if (outFile) {
+    await ensureDir(path.dirname(path.resolve(outFile)));
+    await fsp.writeFile(outFile, `${rendered}\n`, "utf8");
+    process.stderr.write(`Saved rendered output to ${outFile}\n`);
+    return;
+  }
 
   process.stdout.write(`${rendered}\n`);
 }

@@ -1,0 +1,73 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "$0")" && pwd)"
+DOI_SAMPLE_1="10.1126/science.1157784"
+DOI_SAMPLE_2="10.1038/nphys1170"
+TMP_DIR="$(mktemp -d)"
+trap 'rm -rf "$TMP_DIR"' EXIT
+
+need_cmd() {
+  if ! command -v "$1" >/dev/null 2>&1; then
+    echo "Missing required command: $1" >&2
+    exit 1
+  fi
+}
+
+need_cmd curl
+need_cmd perl
+need_cmd node
+need_cmd npm
+
+cd "$ROOT_DIR"
+
+echo "[1/10] help output"
+./crossref-stq --help >/dev/null
+./crossref-doi --help >/dev/null
+./crossref-csl --help >/dev/null
+./crossref-stq --version >/dev/null
+./crossref-doi --version >/dev/null
+./crossref-csl --version >/dev/null
+
+echo "[2/10] install node dependency"
+npm install >/dev/null
+
+echo "[3/10] STQ returns a DOI"
+stq_output="$(
+  printf '%s\n' 'Boucher RC (2004) New concepts of the pathogenesis of cystic fibrosis lung disease. Eur Resp J 23: 146-158.' \
+    | ./crossref-stq
+)"
+printf '%s\n' "$stq_output" | grep -q '^https://doi.org/'
+
+echo "[4/10] DOI text retrieval"
+doi_text_output="$(./crossref-doi "$DOI_SAMPLE_1" --style apa)"
+printf '%s\n' "$doi_text_output" | grep -q 'Strategic Reading'
+
+echo "[5/10] DOI multiple input"
+doi_multi_output="$(printf '%s\n' "$DOI_SAMPLE_1" "$DOI_SAMPLE_2" | ./crossref-doi --format text)"
+printf '%s\n' "$doi_multi_output" | grep -q 'Strategic Reading'
+
+echo "[6/10] DOI file output"
+./crossref-doi "$DOI_SAMPLE_1" "$DOI_SAMPLE_2" --format ris --out "$TMP_DIR/out" >/dev/null 2>&1
+test -f "$TMP_DIR/out/10.1126_science.1157784.ris"
+test -f "$TMP_DIR/out/10.1038_nphys1170.ris"
+
+echo "[7/10] CSL citation rendering"
+csl_citation_output="$(./crossref-csl citation "$DOI_SAMPLE_1" --style apa)"
+printf '%s\n' "$csl_citation_output" | grep -q '('
+
+echo "[8/10] CSL citation details"
+csl_citation_detail_output="$(./crossref-csl citation "$DOI_SAMPLE_1" --style apa --locator '12' --prefix 'see' --suffix 'for discussion')"
+printf '%s\n' "$csl_citation_detail_output" | grep -q '12'
+
+echo "[9/10] CSL bibliography rendering"
+csl_bibliography_output="$(./crossref-csl bibliography "$DOI_SAMPLE_1" "$DOI_SAMPLE_2" --style ieee)"
+printf '%s\n' "$csl_bibliography_output" | grep -q '\[1\]'
+
+echo "[10/10] CSL file output"
+./crossref-csl bibliography "$DOI_SAMPLE_1" --output html --out "$TMP_DIR/bibliography.html" >/dev/null 2>&1
+test -f "$TMP_DIR/bibliography.html"
+grep -q '<div class="csl-bib-body">' "$TMP_DIR/bibliography.html"
+
+echo "All checks passed."
