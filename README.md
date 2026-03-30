@@ -26,17 +26,13 @@
 - [crossref-doi](/Users/iipro/iiworkspace/crossrefCLI/crossref-doi)
 - [crossref-csl](/Users/iipro/iiworkspace/crossrefCLI/crossref-csl)
 - [doi-pdf](/Users/iipro/iiworkspace/crossrefCLI/doi-pdf)
+- [install.sh](/Users/iipro/iiworkspace/crossrefCLI/install.sh)
 - [check](/Users/iipro/iiworkspace/crossrefCLI/check)
 - [README.md](/Users/iipro/iiworkspace/crossrefCLI/README.md)
 
 ## 依赖
 
-`crossref-stq` 和 `crossref-doi` 需要：
-
-- `curl`
-- `perl`
-
-`crossref-csl` 和 `doi-pdf` 需要：
+四个 CLI 现在都基于 Node：
 
 - `node`
 - `npm`
@@ -47,10 +43,39 @@
 npm install
 ```
 
+跨平台全局安装：
+
+```bash
+npm link
+```
+
+这样安装后可以在任意目录直接使用：
+
+```bash
+crossref-stq --help
+crossref-doi 10.1126/science.1157784
+crossref-csl bibliography 10.1126/science.1157784
+doi-pdf --print-config
+```
+
+如果你更偏向本地脚本链接，也可以用：
+
+```bash
+./install.sh
+```
+
+默认会把命令链接到：
+
+```text
+~/.local/bin
+```
+
+如果这个目录还没在 `PATH` 里，安装脚本会提示你加上。
+
 给脚本执行权限：
 
 ```bash
-chmod +x ./crossref-stq ./crossref-doi ./crossref-csl ./doi-pdf ./check
+chmod +x ./crossref-stq ./crossref-doi ./crossref-csl ./doi-pdf ./install.sh ./check
 ```
 
 ## 快速开始
@@ -89,6 +114,13 @@ DOI 渲染 bibliography：
 
 ```bash
 ./crossref-stq refs.txt | ./crossref-csl bibliography --style apa
+```
+
+安装完成后也可以在任意目录直接调用：
+
+```bash
+crossref-doi 10.1126/science.1157784
+doi-pdf --print-config
 ```
 
 ## 命令概览
@@ -445,19 +477,17 @@ printf '%s\n' 10.1126/science.1157784 10.1038/nphys1170 | ./doi-pdf --source 'ht
 
 为了保持脚本简单，项目统一采用少量环境变量。
 
-Shell CLI 可用：
+所有 Node CLI 都可用：
 
 - `CROSSREFCLI_RETRIES`
-  `curl` 重试次数，默认 `2`
-- `CROSSREFCLI_CONNECT_TIMEOUT`
-  连接超时秒数，默认 `10`
+  请求重试次数，默认 `2`
 - `CROSSREFCLI_MAX_TIME`
   单次请求最大秒数，默认 `60`
-
-Node CLI 额外可用：
-
 - `CROSSREFCLI_FETCH_TIMEOUT_MS`
-  `crossref-csl` 单次请求超时，默认 `60000`
+  单次请求超时毫秒数，默认跟随 `CROSSREFCLI_MAX_TIME`
+
+部分命令额外可用：
+
 - `CROSSREFCLI_CACHE_DIR`
   缓存目录
 - `DOI2PDF_SOURCE_URL`

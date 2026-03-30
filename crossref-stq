@@ -1,17 +1,21 @@
-#!/usr/bin/env bash
+#!/usr/bin/env node
 
-set -euo pipefail
+const fs = require("fs");
+const path = require("path");
+const {
+    decodeHtmlEntities,
+    fetchWithRetry,
+    readStdin,
+    readVersion,
+    trim,
+} = require("./lib/node-cli-utils");
 
-BASE_URL="https://apps.crossref.org/SimpleTextQuery"
-USER_AGENT="crossref-stq-shell/0.1.0"
-VERSION="0.1.0"
-CURL_RETRIES="${CROSSREFCLI_RETRIES:-2}"
-CURL_CONNECT_TIMEOUT="${CROSSREFCLI_CONNECT_TIMEOUT:-10}"
-CURL_MAX_TIME="${CROSSREFCLI_MAX_TIME:-60}"
+const BASE_URL = "https://apps.crossref.org/SimpleTextQuery";
+const USER_AGENT = "crossref-stq-node/0.1.0";
+const VERSION = readVersion(__dirname);
 
-usage() {
-  cat <<'EOF'
-Usage:
+function usage() {
+    return `Usage:
   crossref-stq [options] [file]
   crossref-stq --text "citation text"
   cat refs.txt | crossref-stq --stdin
@@ -24,327 +28,240 @@ Options:
   --verbose       Print reference details instead of DOI-only output
   --json          Print JSON
   --version       Show version
-  -h, --help      Show this help
-EOF
+  -h, --help      Show this help`;
 }
 
-need_cmd() {
-  if ! command -v "$1" >/dev/null 2>&1; then
-    echo "Missing required command: $1" >&2
-    exit 1
-  fi
+function fail(message) {
+    console.error(message);
+    process.exit(1);
 }
 
-read_input() {
-  local use_stdin="$1"
-  local text_arg="$2"
-  local file_arg="$3"
+function parseArgs(argv) {
+    const options = {
+        useStdin: false,
+        textArg: "",
+        includePm: false,
+        multiHit: false,
+        verbose: false,
+        json: false,
+        fileArg: "",
+    };
 
-  if [[ -n "$text_arg" ]]; then
-    printf '%s' "$text_arg"
-    return
-  fi
-
-  if [[ "$use_stdin" == "1" ]]; then
-    cat
-    return
-  fi
-
-  if [[ -n "$file_arg" ]]; then
-    cat "$file_arg"
-    return
-  fi
-
-  if [[ ! -t 0 ]]; then
-    cat
-    return
-  fi
-
-  echo "No input provided. Use a file, --text, or --stdin." >&2
-  exit 1
-}
-
-main() {
-  need_cmd curl
-  need_cmd perl
-  need_cmd mktemp
-
-  local use_stdin=0
-  local text_arg=""
-  local include_pm=0
-  local multi_hit=0
-  local verbose_output=0
-  local json_output=0
-  local file_arg=""
-  local -a curl_common_args
-
-  curl_common_args=(
-    -sS
-    --retry "$CURL_RETRIES"
-    --retry-all-errors
-    --connect-timeout "$CURL_CONNECT_TIMEOUT"
-    --max-time "$CURL_MAX_TIME"
-    -A "$USER_AGENT"
-  )
-
-  while [[ $# -gt 0 ]]; do
-    case "$1" in
-      --stdin)
-        use_stdin=1
-        shift
-        ;;
-      --text)
-        text_arg="${2:-}"
-        if [[ -z "$text_arg" ]]; then
-          echo "--text requires a value" >&2
-          exit 1
-        fi
-        shift 2
-        ;;
-      --include-pm)
-        include_pm=1
-        shift
-        ;;
-      --multi-hit)
-        multi_hit=1
-        shift
-        ;;
-      --json)
-        json_output=1
-        shift
-        ;;
-      --verbose)
-        verbose_output=1
-        shift
-        ;;
-      --version)
-        printf '%s\n' "$VERSION"
-        exit 0
-        ;;
-      -h|--help)
-        usage
-        exit 0
-        ;;
-      -*)
-        echo "Unknown option: $1" >&2
-        exit 1
-        ;;
-      *)
-        if [[ -n "$file_arg" ]]; then
-          echo "Only one input file is supported" >&2
-          exit 1
-        fi
-        file_arg="$1"
-        shift
-        ;;
-    esac
-  done
-
-  local input_text
-  input_text="$(read_input "$use_stdin" "$text_arg" "$file_arg")"
-  input_text="${input_text#"${input_text%%[![:space:]]*}"}"
-  input_text="${input_text%"${input_text##*[![:space:]]}"}"
-
-  if [[ -z "$input_text" ]]; then
-    echo "Input is empty." >&2
-    exit 1
-  fi
-
-  local tmpdir
-  tmpdir="$(mktemp -d)"
-  trap 'rm -rf "${tmpdir:-}"' EXIT
-
-  local page_file="$tmpdir/page.html"
-  local result_file="$tmpdir/result.html"
-  local input_file="$tmpdir/input.txt"
-  local cookie_file="$tmpdir/cookies.txt"
-
-  printf '%s' "$input_text" > "$input_file"
-
-  curl \
-    "${curl_common_args[@]}" \
-    -c "$cookie_file" \
-    "$BASE_URL" > "$page_file"
-
-  local form_key
-  form_key="$(
-    perl -0ne 'print $1 if /name="key"\s+value=\s*"([^"]*)"/i' "$page_file"
-  )"
-
-  if [[ -z "$form_key" ]]; then
-    echo "Failed to extract hidden form key." >&2
-    exit 1
-  fi
-
-  local -a curl_args
-  curl_args=(
-    "${curl_common_args[@]}"
-    -b "$cookie_file"
-    -c "$cookie_file"
-    -X POST "$BASE_URL"
-    --data-urlencode "command=Submit"
-    --data-urlencode "key=$form_key"
-    --data-urlencode "freetext@$input_file"
-  )
-
-  if [[ "$include_pm" == "1" ]]; then
-    curl_args+=(--data-urlencode "includePM=on")
-  fi
-  if [[ "$multi_hit" == "1" ]]; then
-    curl_args+=(--data-urlencode "multihit=on")
-  fi
-
-  curl "${curl_args[@]}" > "$result_file"
-
-  if [[ "$json_output" == "1" ]]; then
-    perl -0ne '
-      use strict;
-      use warnings;
-      use JSON::PP;
-
-      my $html = $_;
-      my @rows;
-      while ($html =~ m{<tr class="resultB"><td class="resultB" colspan="4"[^>]*>(.*?)</td></tr>}sig) {
-        my $block = $1;
-        my @dois = ();
-        while ($block =~ m{<a\b[^>]*href="(https://doi\.org/[^"]+)"}sig) {
-          push @dois, $1 unless grep { $_ eq $1 } @dois;
+    for (let index = 0; index < argv.length; index += 1) {
+        const current = argv[index];
+        switch (current) {
+            case "--stdin":
+                options.useStdin = true;
+                break;
+            case "--text":
+                index += 1;
+                options.textArg = argv[index] || "";
+                if (!options.textArg) {
+                    fail("--text requires a value");
+                }
+                break;
+            case "--include-pm":
+                options.includePm = true;
+                break;
+            case "--multi-hit":
+                options.multiHit = true;
+                break;
+            case "--verbose":
+                options.verbose = true;
+                break;
+            case "--json":
+                options.json = true;
+                break;
+            case "--version":
+                console.log(VERSION);
+                process.exit(0);
+                break;
+            case "--help":
+            case "-h":
+                console.log(usage());
+                process.exit(0);
+                break;
+            default:
+                if (current.startsWith("-")) {
+                    fail(`Unknown option: ${current}`);
+                }
+                if (options.fileArg) {
+                    fail("Only one input file is supported");
+                }
+                options.fileArg = current;
+                break;
         }
-
-        my $pmid = undef;
-        if ($block =~ /PMid:\s*([0-9]+)/i) {
-          $pmid = $1;
-        }
-
-        my $text = $block;
-        $text =~ s{<br\s*/?>}{\n}ig;
-        $text =~ s{<a\b[^>]*>.*?</a>}{}sig;
-        $text =~ s{<[^>]+>}{}g;
-        $text =~ s/&nbsp;/ /g;
-        $text =~ s/\r//g;
-        my @lines = grep { length $_ } map {
-          my $v = $_;
-          $v =~ s/^\s+//;
-          $v =~ s/\s+$//;
-          $v =~ s/\s+/ /g;
-          $v;
-        } split /\n+/, $text;
-
-        my $reference = "";
-        for my $line (@lines) {
-          next if $line =~ /doi\.org\//i;
-          next if $line =~ /^PMid:/i;
-          $reference = $line;
-          last;
-        }
-
-        push @rows, {
-          reference => $reference,
-          dois => \@dois,
-          pmid => $pmid,
-        };
-      }
-
-      print JSON::PP->new->utf8->pretty->encode(\@rows);
-    ' "$result_file"
-    exit 0
-  fi
-
-  if [[ "$verbose_output" == "1" ]]; then
-    perl -0ne '
-      use strict;
-      use warnings;
-
-      my $html = $_;
-      my @blocks = ();
-      while ($html =~ m{<tr class="resultB"><td class="resultB" colspan="4"[^>]*>(.*?)</td></tr>}sig) {
-        push @blocks, $1;
-      }
-
-      if (!@blocks) {
-        print "No matches returned.\n";
-        exit 0;
-      }
-
-      my $index = 1;
-      for my $block (@blocks) {
-        my @dois = ();
-        while ($block =~ m{<a\b[^>]*href="(https://doi\.org/[^"]+)"}sig) {
-          push @dois, $1 unless grep { $_ eq $1 } @dois;
-        }
-
-        my $pmid = undef;
-        if ($block =~ /PMid:\s*([0-9]+)/i) {
-          $pmid = $1;
-        }
-
-        my $text = $block;
-        $text =~ s{<br\s*/?>}{\n}ig;
-        $text =~ s{<a\b[^>]*>.*?</a>}{}sig;
-        $text =~ s{<[^>]+>}{}g;
-        $text =~ s/&nbsp;/ /g;
-        $text =~ s/\r//g;
-        my @lines = grep { length $_ } map {
-          my $v = $_;
-          $v =~ s/^\s+//;
-          $v =~ s/\s+$//;
-          $v =~ s/\s+/ /g;
-          $v;
-        } split /\n+/, $text;
-
-        my $reference = "(empty reference)";
-        for my $line (@lines) {
-          next if $line =~ /doi\.org\//i;
-          next if $line =~ /^PMid:/i;
-          $reference = $line;
-          last;
-        }
-
-        print "[$index] $reference\n";
-        if (@dois) {
-          for my $doi (@dois) {
-            print "  DOI: $doi\n";
-          }
-        } else {
-          print "  DOI: (none)\n";
-        }
-        if (defined $pmid) {
-          print "  PMID: $pmid\n";
-        }
-        print "\n" if $index < scalar @blocks;
-        $index++;
-      }
-    ' "$result_file"
-    exit 0
-  fi
-
-  perl -0ne '
-    use strict;
-    use warnings;
-
-    my $html = $_;
-    my @blocks = ();
-    while ($html =~ m{<tr class="resultB"><td class="resultB" colspan="4"[^>]*>(.*?)</td></tr>}sig) {
-      push @blocks, $1;
     }
 
-    if (!@blocks) {
-      print "No matches returned.\n";
-      exit 0;
-    }
-
-    for my $block (@blocks) {
-      my @dois = ();
-      while ($block =~ m{<a\b[^>]*href="(https://doi\.org/[^"]+)"}sig) {
-        push @dois, $1 unless grep { $_ eq $1 } @dois;
-      }
-      if (@dois) {
-        for my $doi (@dois) {
-          print "$doi\n";
-        }
-      }
-    }
-  ' "$result_file"
+    return options;
 }
 
-main "$@"
+async function readInput(options) {
+    if (options.textArg) {
+        return options.textArg;
+    }
+
+    if (options.useStdin) {
+        return readStdin();
+    }
+
+    if (options.fileArg) {
+        return fs.promises.readFile(options.fileArg, "utf8");
+    }
+
+    if (!process.stdin.isTTY) {
+        return readStdin();
+    }
+
+    fail("No input provided. Use a file, --text, or --stdin.");
+}
+
+function extractFormKey(html) {
+    const match = String(html || "").match(/name="key"\s+value=\s*"([^"]*)"/i);
+    return match ? match[1] : "";
+}
+
+function extractCookieHeader(headers) {
+    const raw = typeof headers.getSetCookie === "function"
+        ? headers.getSetCookie().join(", ")
+        : headers.get("set-cookie") || "";
+
+    const matches = raw.match(/[A-Za-z0-9_]+=[^;,]+/g) || [];
+    return matches.join("; ");
+}
+
+function extractResultBlocks(html) {
+    const blocks = [];
+    const pattern = /<tr class="resultB"><td class="resultB" colspan="4"[^>]*>(.*?)<\/td><\/tr>/gis;
+    for (const match of String(html || "").matchAll(pattern)) {
+        blocks.push(match[1]);
+    }
+    return blocks;
+}
+
+function parseResultBlock(block) {
+    const dois = [];
+    for (const match of String(block || "").matchAll(/<a\b[^>]*href="(https:\/\/doi\.org\/[^"]+)"/gis)) {
+        if (!dois.includes(match[1])) {
+            dois.push(match[1]);
+        }
+    }
+
+    const pmidMatch = String(block || "").match(/PMid:\s*([0-9]+)/i);
+    const pmid = pmidMatch ? pmidMatch[1] : null;
+
+    let text = String(block || "")
+        .replace(/<br\s*\/?>/gi, "\n")
+        .replace(/<a\b[^>]*>.*?<\/a>/gis, "")
+        .replace(/<[^>]+>/g, "")
+        .replace(/\r/g, "");
+    text = decodeHtmlEntities(text);
+
+    const lines = text
+        .split(/\n+/)
+        .map((item) => item.trim().replace(/\s+/g, " "))
+        .filter(Boolean);
+
+    let reference = "";
+    for (const line of lines) {
+        if (/doi\.org\//i.test(line)) {
+            continue;
+        }
+        if (/^PMid:/i.test(line)) {
+            continue;
+        }
+        reference = line;
+        break;
+    }
+
+    return {
+        reference,
+        dois,
+        pmid,
+    };
+}
+
+async function main() {
+    const options = parseArgs(process.argv.slice(2));
+    let inputText = trim(await readInput(options));
+    if (!inputText) {
+        fail("Input is empty.");
+    }
+
+    const pageResponse = await fetchWithRetry(BASE_URL, {
+        headers: {
+            "user-agent": USER_AGENT,
+        },
+    });
+    const pageHtml = await pageResponse.text();
+    const formKey = extractFormKey(pageHtml);
+    if (!formKey) {
+        fail("Failed to extract hidden form key.");
+    }
+
+    const cookieHeader = extractCookieHeader(pageResponse.headers);
+    const params = new URLSearchParams();
+    params.set("command", "Submit");
+    params.set("key", formKey);
+    params.set("freetext", inputText);
+    if (options.includePm) {
+        params.set("includePM", "on");
+    }
+    if (options.multiHit) {
+        params.set("multihit", "on");
+    }
+
+    const resultResponse = await fetchWithRetry(BASE_URL, {
+        method: "POST",
+        headers: {
+            "user-agent": USER_AGENT,
+            "content-type": "application/x-www-form-urlencoded",
+            ...(cookieHeader ? { cookie: cookieHeader } : {}),
+        },
+        body: params.toString(),
+    });
+    const resultHtml = await resultResponse.text();
+    const rows = extractResultBlocks(resultHtml).map(parseResultBlock);
+
+    if (options.json) {
+        console.log(JSON.stringify(rows, null, 2));
+        return;
+    }
+
+    if (rows.length === 0) {
+        console.log("No matches returned.");
+        return;
+    }
+
+    if (options.verbose) {
+        rows.forEach((row, index) => {
+            const reference = row.reference || "(empty reference)";
+            process.stdout.write(`[${index + 1}] ${reference}\n`);
+            if (row.dois.length > 0) {
+                row.dois.forEach((doi) => {
+                    process.stdout.write(`  DOI: ${doi}\n`);
+                });
+            } else {
+                process.stdout.write("  DOI: (none)\n");
+            }
+            if (row.pmid) {
+                process.stdout.write(`  PMID: ${row.pmid}\n`);
+            }
+            if (index < rows.length - 1) {
+                process.stdout.write("\n");
+            }
+        });
+        return;
+    }
+
+    for (const row of rows) {
+        for (const doi of row.dois) {
+            process.stdout.write(`${doi}\n`);
+        }
+    }
+}
+
+main().catch((error) => {
+    console.error(error.message);
+    process.exit(1);
+});

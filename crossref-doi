@@ -1,21 +1,28 @@
-#!/usr/bin/env bash
+#!/usr/bin/env node
 
-set -euo pipefail
+const fs = require("fs");
+const path = require("path");
+const {
+    fetchWithRetry,
+    formatStyleSuggestions,
+    readStdin,
+    readVersion,
+    sanitizeFilename,
+    splitNonEmptyLines,
+    strictUrlEncode,
+    trim,
+} = require("./lib/node-cli-utils");
 
-USER_AGENT="crossref-doi-shell/0.1.0"
-VERSION="0.1.0"
-DOI_BASE_URL="https://doi.org"
-CROSSREF_API_BASE_URL="https://api.crossref.org"
-CURL_RETRIES="${CROSSREFCLI_RETRIES:-2}"
-CURL_CONNECT_TIMEOUT="${CROSSREFCLI_CONNECT_TIMEOUT:-10}"
-CURL_MAX_TIME="${CROSSREFCLI_MAX_TIME:-60}"
+const VERSION = readVersion(__dirname);
+const USER_AGENT = "crossref-doi-node/0.1.0";
+const DOI_BASE_URL = "https://doi.org";
+const CROSSREF_API_BASE_URL = "https://api.crossref.org";
 
-usage() {
-  cat <<'EOF'
-Usage:
+function usage() {
+    return `Usage:
   crossref-doi [options] DOI...
   crossref-doi --doi DOI --doi DOI --format text --style apa
-  printf '%s\n' DOI DOI | crossref-doi
+  printf '%s\\n' DOI DOI | crossref-doi
   crossref-doi --list-styles
 
 Options:
@@ -29,435 +36,316 @@ Options:
   --show-styles N  Show the first N CSL style names
   --list-styles    Print supported CSL style names from Crossref
   --version        Show version
-  -h, --help       Show this help
-EOF
+  -h, --help       Show this help`;
 }
 
-need_cmd() {
-  if ! command -v "$1" >/dev/null 2>&1; then
-    echo "Missing required command: $1" >&2
-    exit 1
-  fi
+function fail(message) {
+    console.error(message);
+    process.exit(1);
 }
 
-trim() {
-  local value="$1"
-  value="${value#"${value%%[![:space:]]*}"}"
-  value="${value%"${value##*[![:space:]]}"}"
-  printf '%s' "$value"
-}
-
-read_dois_from_stdin() {
-  perl -ne '
-    s/\r?\n$//;
-    s/^\s+//;
-    s/\s+$//;
-    print "$_\n" if length $_;
-  '
-}
-
-urlencode() {
-  perl -e '
-    use strict;
-    use warnings;
-    use bytes;
-
-    my $input = shift // q{};
-    for my $ch (split //, $input) {
-      if ($ch =~ /[A-Za-z0-9\-\._~]/) {
-        print $ch;
-      } else {
-        printf "%%%02X", ord($ch);
-      }
+function fileExtensionForFormat(format) {
+    switch (format) {
+        case "text":
+            return "txt";
+        case "bibtex":
+            return "bib";
+        case "ris":
+            return "ris";
+        case "csljson":
+            return "csl.json";
+        case "json":
+            return "json";
+        case "unixref":
+            return "unixref.xml";
+        case "unixsd":
+            return "unixsd.xml";
+        default:
+            return "out";
     }
-  ' "$1"
 }
 
-sanitize_filename() {
-  perl -e '
-    use strict;
-    use warnings;
-    my $value = shift // q{};
-    $value =~ s{[\/\\:\*\?"<>\|]}{_}g;
-    $value =~ s/\s+/_/g;
-    $value =~ s/_+/_/g;
-    $value =~ s/^_+//;
-    $value =~ s/_+$//;
-    print length($value) ? $value : "item";
-  ' "$1"
+function parseArgs(argv) {
+    const options = {
+        dois: [],
+        format: "text",
+        style: "apa",
+        locale: "en-US",
+        outDir: "",
+        listStyles: false,
+        searchStyle: "",
+        showStyles: "",
+    };
+
+    for (let index = 0; index < argv.length; index += 1) {
+        const current = argv[index];
+        switch (current) {
+            case "--doi":
+                index += 1;
+                if (!argv[index]) {
+                    fail("--doi requires a value");
+                }
+                options.dois.push(argv[index]);
+                break;
+            case "--format":
+                index += 1;
+                options.format = argv[index] || "";
+                if (!options.format) {
+                    fail("--format requires a value");
+                }
+                break;
+            case "--style":
+                index += 1;
+                options.style = argv[index] || "";
+                if (!options.style) {
+                    fail("--style requires a value");
+                }
+                break;
+            case "--locale":
+                index += 1;
+                options.locale = argv[index] || "";
+                if (!options.locale) {
+                    fail("--locale requires a value");
+                }
+                break;
+            case "--out":
+                index += 1;
+                options.outDir = argv[index] || "";
+                if (!options.outDir) {
+                    fail("--out requires a value");
+                }
+                break;
+            case "--list-styles":
+                options.listStyles = true;
+                break;
+            case "--search-style":
+                index += 1;
+                options.searchStyle = argv[index] || "";
+                if (!options.searchStyle) {
+                    fail("--search-style requires a value");
+                }
+                break;
+            case "--show-styles":
+                index += 1;
+                options.showStyles = argv[index] || "";
+                if (!options.showStyles) {
+                    fail("--show-styles requires a value");
+                }
+                break;
+            case "--version":
+                console.log(VERSION);
+                process.exit(0);
+                break;
+            case "--help":
+            case "-h":
+                console.log(usage());
+                process.exit(0);
+                break;
+            default:
+                if (current.startsWith("-")) {
+                    fail(`Unknown option: ${current}`);
+                }
+                options.dois.push(current);
+                break;
+        }
+    }
+
+    return options;
 }
 
-file_extension_for_format() {
-  case "$1" in
-    text) printf 'txt' ;;
-    bibtex) printf 'bib' ;;
-    ris) printf 'ris' ;;
-    csljson) printf 'csl.json' ;;
-    json) printf 'json' ;;
-    unixref) printf 'unixref.xml' ;;
-    unixsd) printf 'unixsd.xml' ;;
-    *) printf 'out' ;;
-  esac
+async function listStylesFromApi() {
+    const response = await fetchWithRetry(`${CROSSREF_API_BASE_URL}/v1/styles`, {
+        headers: {
+            "user-agent": USER_AGENT,
+        },
+    });
+    const payload = await response.json();
+    const items = payload?.message?.items;
+    return Array.isArray(items) ? items : [];
 }
 
-main() {
-  need_cmd curl
-  need_cmd perl
+async function ensureValidStyle(style) {
+    const styles = await listStylesFromApi();
+    const result = formatStyleSuggestions(style, styles);
+    if (result.ok) {
+        return;
+    }
 
-  local -a curl_common_args
-  curl_common_args=(
-    -sSL
-    --retry "$CURL_RETRIES"
-    --retry-all-errors
-    --connect-timeout "$CURL_CONNECT_TIMEOUT"
-    --max-time "$CURL_MAX_TIME"
-    -A "$USER_AGENT"
-  )
+    console.error(`Unknown CSL style: ${style}`);
+    if (result.suggestions.length > 0) {
+        console.error("Did you mean:");
+        result.suggestions.forEach((item) => {
+            console.error(`  - ${item}`);
+        });
+    } else {
+        console.error("Use --list-styles or --search-style to inspect available styles.");
+    }
+    process.exit(1);
+}
 
-  list_styles_from_api() {
-    curl "${curl_common_args[@]}" \
-      "${CROSSREF_API_BASE_URL}/v1/styles" \
-      | perl -0ne '
-          use strict;
-          use warnings;
-          use JSON::PP;
+async function maybeExplainStyleFailure(style, error) {
+    try {
+        await ensureValidStyle(style);
+    } catch (styleError) {
+        throw styleError;
+    }
 
-          my $payload = decode_json($_);
-          my $items = $payload->{message}{items} // [];
-          print join("\n", @$items), "\n";
-        '
-  }
+    throw error;
+}
 
-  fetch_one() {
-    local url="$1"
-    local accept_header="${2:-}"
+async function fetchOne(url, acceptHeader) {
+    const headers = {
+        "user-agent": USER_AGENT,
+    };
+    if (acceptHeader) {
+        headers.accept = acceptHeader;
+    }
+    const response = await fetchWithRetry(url, { headers });
+    return response.text();
+}
 
-    if [[ -n "$accept_header" ]]; then
-      curl "${curl_common_args[@]}" \
-        -H "Accept: ${accept_header}" \
-        "$url"
-    else
-      curl "${curl_common_args[@]}" "$url"
-    fi
-  }
+function getRequestConfig(format, doi, style, locale) {
+    const encoded = strictUrlEncode(doi);
 
-  ensure_valid_style() {
-    local requested_style="$1"
-    local style_check
+    switch (format) {
+        case "text":
+            return {
+                url: `${DOI_BASE_URL}/${encoded}`,
+                acceptHeader: `text/x-bibliography; style=${style}; locale=${locale}`,
+            };
+        case "bibtex":
+            return {
+                url: `${DOI_BASE_URL}/${encoded}`,
+                acceptHeader: "application/x-bibtex",
+            };
+        case "ris":
+            return {
+                url: `${DOI_BASE_URL}/${encoded}`,
+                acceptHeader: "application/x-research-info-systems",
+            };
+        case "csljson":
+            return {
+                url: `${DOI_BASE_URL}/${encoded}`,
+                acceptHeader: "application/vnd.citationstyles.csl+json",
+            };
+        case "unixref":
+            return {
+                url: `${DOI_BASE_URL}/${encoded}`,
+                acceptHeader: "application/vnd.crossref.unixref+xml",
+            };
+        case "unixsd":
+            return {
+                url: `${DOI_BASE_URL}/${encoded}`,
+                acceptHeader: "application/vnd.crossref.unixsd+xml",
+            };
+        case "json":
+            return {
+                url: `${CROSSREF_API_BASE_URL}/works/${encoded}`,
+                acceptHeader: "",
+            };
+        default:
+            fail(`Unsupported format: ${format}\nSupported formats: text, bibtex, ris, csljson, json, unixref, unixsd`);
+    }
+}
 
-    style_check="$(
-      list_styles_from_api | perl -e '
-        use strict;
-        use warnings;
+function validateShowStyles(value) {
+    if (!/^[1-9][0-9]*$/.test(value)) {
+        fail("--show-styles requires an integer greater than 0");
+    }
+}
 
-        my $needle = lc(shift // q{});
-        my @items = <STDIN>;
-        chomp @items;
+async function main() {
+    const options = parseArgs(process.argv.slice(2));
 
-        sub distance {
-          my ($a, $b) = @_;
-          my @a = split //, $a;
-          my @b = split //, $b;
-          my @d;
-          $d[$_][0] = $_ for 0 .. @a;
-          $d[0][$_] = $_ for 0 .. @b;
-          for my $i (1 .. @a) {
-            for my $j (1 .. @b) {
-              my $cost = ($a[$i - 1] eq $b[$j - 1]) ? 0 : 1;
-              my $del = $d[$i - 1][$j] + 1;
-              my $ins = $d[$i][$j - 1] + 1;
-              my $sub = $d[$i - 1][$j - 1] + $cost;
-              my $min = $del < $ins ? $del : $ins;
-              $min = $sub if $sub < $min;
-              $d[$i][$j] = $min;
+    if (options.listStyles) {
+        const styles = await listStylesFromApi();
+        process.stdout.write(`${styles.join("\n")}\n`);
+        return;
+    }
+
+    if (options.searchStyle) {
+        const styles = await listStylesFromApi();
+        const matches = styles.filter((item) => item.toLowerCase().includes(options.searchStyle.toLowerCase()));
+        if (matches.length > 0) {
+            process.stdout.write(`${matches.join("\n")}\n`);
+        }
+        return;
+    }
+
+    if (options.showStyles) {
+        validateShowStyles(options.showStyles);
+        const styles = await listStylesFromApi();
+        process.stdout.write(`${styles.slice(0, Number.parseInt(options.showStyles, 10)).join("\n")}\n`);
+        return;
+    }
+
+    if (options.dois.length === 0 && !process.stdin.isTTY) {
+        const stdinText = await readStdin();
+        options.dois.push(...splitNonEmptyLines(stdinText));
+    }
+
+    const finalDois = options.dois.map(trim).filter(Boolean);
+    if (finalDois.length === 0) {
+        fail("No DOI provided. Pass one or more DOIs, or pipe DOI lines on stdin.");
+    }
+
+    if (options.outDir) {
+        await fs.promises.mkdir(options.outDir, { recursive: true });
+    }
+
+    const payloads = [];
+    for (let index = 0; index < finalDois.length; index += 1) {
+        const doi = finalDois[index];
+        const request = getRequestConfig(options.format, doi, options.style, options.locale);
+        let content;
+        try {
+            content = await fetchOne(request.url, request.acceptHeader);
+        } catch (error) {
+            if (options.format === "text") {
+                await maybeExplainStyleFailure(options.style, error);
             }
-          }
-          return $d[@a][@b];
+            throw error;
         }
 
-        my %seen;
-        my @exact = grep { lc($_) eq $needle } @items;
-        if (@exact) {
-          print "OK\n";
-          exit 0;
+        if (options.outDir) {
+            const outputFile = path.join(
+                options.outDir,
+                `${sanitizeFilename(doi)}.${fileExtensionForFormat(options.format)}`,
+            );
+            await fs.promises.writeFile(outputFile, content, "utf8");
+        } else {
+            payloads.push(content);
+        }
+    }
+
+    if (!options.outDir) {
+        if (options.format === "json" || options.format === "csljson") {
+            if (payloads.length === 1) {
+                process.stdout.write(payloads[0]);
+            } else {
+                const parsed = payloads.map((item) => JSON.parse(item));
+                process.stdout.write(`${JSON.stringify(parsed, null, 2)}\n`);
+            }
+            return;
         }
 
-        my @contains = grep { index(lc($_), $needle) >= 0 } @items;
-        my @ranked = sort {
-          distance(lc($a), $needle) <=> distance(lc($b), $needle) || $a cmp $b
-        } @items;
-        my @suggestions = ();
-        for my $item (@contains, @ranked) {
-          next if $seen{$item}++;
-          push @suggestions, $item;
-          last if @suggestions >= 5;
-        }
+        payloads.forEach((item, index) => {
+            process.stdout.write(item);
+            if (index < payloads.length - 1) {
+                process.stdout.write(options.format === "text" ? "\n" : "\n\n");
+            }
+        });
+        return;
+    }
 
-        print "MISS\n";
-        print "$_\n" for @suggestions;
-      ' "$requested_style"
-    )"
-
-    if [[ "${style_check%%$'\n'*}" == "OK" ]]; then
-      return 0
-    fi
-
-    {
-      printf 'Unknown CSL style: %s\n' "$requested_style"
-      local suggestions="${style_check#*$'\n'}"
-      if [[ -n "$suggestions" && "$suggestions" != "$style_check" ]]; then
-        printf 'Did you mean:\n'
-        while IFS= read -r line; do
-          [[ -z "$line" ]] && continue
-          printf '  - %s\n' "$line"
-        done <<< "$suggestions"
-      else
-        printf 'Use --list-styles or --search-style to inspect available styles.\n'
-      fi
-    } >&2
-    exit 1
-  }
-
-  local -a dois=()
-  local format="text"
-  local style="apa"
-  local locale="en-US"
-  local out_dir=""
-  local list_styles=0
-  local search_style=""
-  local show_styles=""
-
-  while [[ $# -gt 0 ]]; do
-    case "$1" in
-      --doi)
-        local one_doi="${2:-}"
-        if [[ -z "$one_doi" ]]; then
-          echo "--doi requires a value" >&2
-          exit 1
-        fi
-        dois+=("$one_doi")
-        shift 2
-        ;;
-      --format)
-        format="${2:-}"
-        if [[ -z "$format" ]]; then
-          echo "--format requires a value" >&2
-          exit 1
-        fi
-        shift 2
-        ;;
-      --style)
-        style="${2:-}"
-        if [[ -z "$style" ]]; then
-          echo "--style requires a value" >&2
-          exit 1
-        fi
-        shift 2
-        ;;
-      --locale)
-        locale="${2:-}"
-        if [[ -z "$locale" ]]; then
-          echo "--locale requires a value" >&2
-          exit 1
-        fi
-        shift 2
-        ;;
-      --out)
-        out_dir="${2:-}"
-        if [[ -z "$out_dir" ]]; then
-          echo "--out requires a value" >&2
-          exit 1
-        fi
-        shift 2
-        ;;
-      --list-styles)
-        list_styles=1
-        shift
-        ;;
-      --search-style)
-        search_style="${2:-}"
-        if [[ -z "$search_style" ]]; then
-          echo "--search-style requires a value" >&2
-          exit 1
-        fi
-        shift 2
-        ;;
-      --show-styles)
-        show_styles="${2:-}"
-        if [[ -z "$show_styles" ]]; then
-          echo "--show-styles requires a value" >&2
-          exit 1
-        fi
-        shift 2
-        ;;
-      --version)
-        printf '%s\n' "$VERSION"
-        exit 0
-        ;;
-      -h|--help)
-        usage
-        exit 0
-        ;;
-      -*)
-        echo "Unknown option: $1" >&2
-        exit 1
-        ;;
-      *)
-        dois+=("$1")
-        shift
-        ;;
-    esac
-  done
-
-  if [[ "$list_styles" == "1" ]]; then
-    list_styles_from_api
-    exit 0
-  fi
-
-  if [[ -n "$search_style" ]]; then
-    list_styles_from_api | grep -i -- "$search_style" || true
-    exit 0
-  fi
-
-  if [[ -n "$show_styles" ]]; then
-    if ! [[ "$show_styles" =~ ^[1-9][0-9]*$ ]]; then
-      echo "--show-styles requires an integer greater than 0" >&2
-      exit 1
-    fi
-    list_styles_from_api | sed -n "1,${show_styles}p"
-    exit 0
-  fi
-
-  if [[ "${#dois[@]}" -eq 0 && ! -t 0 ]]; then
-    while IFS= read -r line; do
-      dois+=("$line")
-    done < <(read_dois_from_stdin)
-  fi
-
-  local -a final_dois=()
-  local item
-  for item in "${dois[@]}"; do
-    item="$(trim "$item")"
-    [[ -z "$item" ]] && continue
-    final_dois+=("$item")
-  done
-
-  if [[ "${#final_dois[@]}" -eq 0 ]]; then
-    echo "No DOI provided. Pass one or more DOIs, or pipe DOI lines on stdin." >&2
-    exit 1
-  fi
-
-  if [[ "$format" == "text" ]]; then
-    ensure_valid_style "$style"
-  fi
-
-  if [[ -n "$out_dir" ]]; then
-    mkdir -p "$out_dir"
-  fi
-
-  local tmpdir=""
-  if [[ "$format" == "json" || "$format" == "csljson" ]]; then
-    tmpdir="$(mktemp -d)"
-    trap 'rm -rf "${tmpdir:-}"' EXIT
-  fi
-
-  local idx=0
-  local total="${#final_dois[@]}"
-  local doi encoded_doi accept_header url out_file output_file extension
-  for doi in "${final_dois[@]}"; do
-    encoded_doi="$(urlencode "$doi")"
-    case "$format" in
-      text)
-        accept_header="text/x-bibliography; style=${style}; locale=${locale}"
-        url="${DOI_BASE_URL}/${encoded_doi}"
-        ;;
-      bibtex)
-        accept_header="application/x-bibtex"
-        url="${DOI_BASE_URL}/${encoded_doi}"
-        ;;
-      ris)
-        accept_header="application/x-research-info-systems"
-        url="${DOI_BASE_URL}/${encoded_doi}"
-        ;;
-      csljson)
-        accept_header="application/vnd.citationstyles.csl+json"
-        url="${DOI_BASE_URL}/${encoded_doi}"
-        ;;
-      unixref)
-        accept_header="application/vnd.crossref.unixref+xml"
-        url="${DOI_BASE_URL}/${encoded_doi}"
-        ;;
-      unixsd)
-        accept_header="application/vnd.crossref.unixsd+xml"
-        url="${DOI_BASE_URL}/${encoded_doi}"
-        ;;
-      json)
-        accept_header=""
-        url="${CROSSREF_API_BASE_URL}/works/${encoded_doi}"
-        ;;
-      *)
-        echo "Unsupported format: $format" >&2
-        echo "Supported formats: text, bibtex, ris, csljson, json, unixref, unixsd" >&2
-        exit 1
-        ;;
-    esac
-
-    if [[ "$format" == "json" || "$format" == "csljson" ]]; then
-      out_file="$tmpdir/$idx.json"
-      fetch_one "$url" "$accept_header" > "$out_file"
-      if [[ -n "$out_dir" ]]; then
-        extension="$(file_extension_for_format "$format")"
-        output_file="$out_dir/$(sanitize_filename "$doi").$extension"
-        cp "$out_file" "$output_file"
-      fi
-    else
-      if [[ -n "$out_dir" ]]; then
-        extension="$(file_extension_for_format "$format")"
-        output_file="$out_dir/$(sanitize_filename "$doi").$extension"
-        fetch_one "$url" "$accept_header" > "$output_file"
-      else
-        fetch_one "$url" "$accept_header"
-        if [[ "$idx" -lt $((total - 1)) ]]; then
-          printf '\n'
-          if [[ "$format" != "text" ]]; then
-            printf '\n'
-          fi
-        fi
-      fi
-    fi
-    idx=$((idx + 1))
-  done
-
-  if [[ "$format" == "json" || "$format" == "csljson" ]]; then
-    if [[ -z "$out_dir" ]]; then
-      if [[ "$total" -eq 1 ]]; then
-        cat "$tmpdir/0.json"
-      else
-        perl -MJSON::PP -e '
-          use strict;
-          use warnings;
-          my @files = @ARGV;
-          my @items;
-          for my $file (@files) {
-            open my $fh, "<", $file or die "Unable to read $file: $!";
-            local $/;
-            my $content = <$fh>;
-            close $fh;
-            push @items, decode_json($content);
-          }
-          print JSON::PP->new->utf8->pretty->encode(\@items);
-        ' "$tmpdir"/*.json
-      fi
-    fi
-  fi
-
-  if [[ -n "$out_dir" ]]; then
-    if [[ "$total" -eq 1 ]]; then
-      printf 'Saved 1 file to %s\n' "$out_dir" >&2
-    else
-      printf 'Saved %s files to %s\n' "$total" "$out_dir" >&2
-    fi
-  fi
+    if (finalDois.length === 1) {
+        console.error(`Saved 1 file to ${options.outDir}`);
+    } else {
+        console.error(`Saved ${finalDois.length} files to ${options.outDir}`);
+    }
 }
 
-main "$@"
+main().catch((error) => {
+    console.error(error.message);
+    process.exit(1);
+});

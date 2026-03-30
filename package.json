@@ -2,8 +2,14 @@
   "name": "crossref-cli-tools",
   "private": true,
   "version": "0.1.0",
-  "description": "Lightweight Crossref CLIs for DOI lookup and CSL rendering",
+  "description": "Lightweight Node-based Crossref CLIs for DOI lookup, metadata retrieval, CSL rendering, and PDF download",
   "license": "UNLICENSED",
+  "bin": {
+    "crossref-stq": "./crossref-stq",
+    "crossref-doi": "./crossref-doi",
+    "crossref-csl": "./crossref-csl",
+    "doi-pdf": "./doi-pdf"
+  },
   "dependencies": {
     "citeproc": "^2.4.63"
   }
