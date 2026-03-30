@@ -19,6 +19,8 @@ Options:
                    Default: text
   --style NAME     CSL style for --format text. Default: apa
   --locale NAME    Locale for --format text. Default: en-US
+  --search-style K Search supported CSL style names by keyword
+  --show-styles N  Show the first N CSL style names
   --list-styles    Print supported CSL style names from Crossref
   -h, --help       Show this help
 EOF
@@ -59,11 +61,27 @@ main() {
   need_cmd curl
   need_cmd perl
 
+  list_styles_from_api() {
+    curl -sSL -A "$USER_AGENT" \
+      "${CROSSREF_API_BASE_URL}/v1/styles" \
+      | perl -0ne '
+          use strict;
+          use warnings;
+          use JSON::PP;
+
+          my $payload = decode_json($_);
+          my $items = $payload->{message}{items} // [];
+          print join("\n", @$items), "\n";
+        '
+  }
+
   local doi=""
   local format="text"
   local style="apa"
   local locale="en-US"
   local list_styles=0
+  local search_style=""
+  local show_styles=""
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -103,6 +121,22 @@ main() {
         list_styles=1
         shift
         ;;
+      --search-style)
+        search_style="${2:-}"
+        if [[ -z "$search_style" ]]; then
+          echo "--search-style requires a value" >&2
+          exit 1
+        fi
+        shift 2
+        ;;
+      --show-styles)
+        show_styles="${2:-}"
+        if [[ -z "$show_styles" ]]; then
+          echo "--show-styles requires a value" >&2
+          exit 1
+        fi
+        shift 2
+        ;;
       -h|--help)
         usage
         exit 0
@@ -123,17 +157,21 @@ main() {
   done
 
   if [[ "$list_styles" == "1" ]]; then
-    curl -sSL -A "$USER_AGENT" \
-      "${CROSSREF_API_BASE_URL}/v1/styles" \
-      | perl -0ne '
-          use strict;
-          use warnings;
-          use JSON::PP;
+    list_styles_from_api
+    exit 0
+  fi
 
-          my $payload = decode_json($_);
-          my $items = $payload->{message}{items} // [];
-          print join("\n", @$items), "\n";
-        '
+  if [[ -n "$search_style" ]]; then
+    list_styles_from_api | grep -i -- "$search_style" || true
+    exit 0
+  fi
+
+  if [[ -n "$show_styles" ]]; then
+    if ! [[ "$show_styles" =~ ^[1-9][0-9]*$ ]]; then
+      echo "--show-styles requires an integer greater than 0" >&2
+      exit 1
+    fi
+    list_styles_from_api | sed -n "1,${show_styles}p"
     exit 0
   fi
 
@@ -151,27 +189,27 @@ main() {
   case "$format" in
     text)
       accept_header="text/x-bibliography; style=${style}; locale=${locale}"
-      url="${DOI_BASE_URL}/${doi}"
+      url="${DOI_BASE_URL}/${encoded_doi}"
       ;;
     bibtex)
       accept_header="application/x-bibtex"
-      url="${DOI_BASE_URL}/${doi}"
+      url="${DOI_BASE_URL}/${encoded_doi}"
       ;;
     ris)
       accept_header="application/x-research-info-systems"
-      url="${DOI_BASE_URL}/${doi}"
+      url="${DOI_BASE_URL}/${encoded_doi}"
       ;;
     csljson)
       accept_header="application/vnd.citationstyles.csl+json"
-      url="${DOI_BASE_URL}/${doi}"
+      url="${DOI_BASE_URL}/${encoded_doi}"
       ;;
     unixref)
       accept_header="application/vnd.crossref.unixref+xml"
-      url="${DOI_BASE_URL}/${doi}"
+      url="${DOI_BASE_URL}/${encoded_doi}"
       ;;
     unixsd)
       accept_header="application/vnd.crossref.unixsd+xml"
-      url="${DOI_BASE_URL}/${doi}"
+      url="${DOI_BASE_URL}/${encoded_doi}"
       ;;
     json)
       url="${CROSSREF_API_BASE_URL}/works/${encoded_doi}"

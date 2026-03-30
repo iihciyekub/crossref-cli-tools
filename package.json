@@ -1,0 +1,10 @@
+{
+  "name": "crossref-cli-tools",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Lightweight Crossref CLIs for DOI lookup and CSL rendering",
+  "license": "UNLICENSED",
+  "dependencies": {
+    "citeproc": "^2.4.63"
+  }
+}

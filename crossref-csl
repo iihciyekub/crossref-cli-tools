@@ -1,0 +1,390 @@
+#!/usr/bin/env node
+
+"use strict";
+
+const fs = require("node:fs");
+const fsp = require("node:fs/promises");
+const os = require("node:os");
+const path = require("node:path");
+const process = require("node:process");
+const CSL = require("citeproc");
+
+const USER_AGENT = "crossref-csl/0.1.0";
+const DOI_BASE_URL = "https://doi.org";
+const STYLES_LIST_URL = "https://api.crossref.org/v1/styles";
+const STYLE_BASE_URL = "https://raw.githubusercontent.com/citation-style-language/styles/master";
+const LOCALE_BASE_URL = "https://raw.githubusercontent.com/citation-style-language/locales/master";
+const CACHE_DIR =
+  process.env.CROSSREFCLI_CACHE_DIR ||
+  path.join(process.env.XDG_CACHE_HOME || path.join(os.homedir(), ".cache"), "crossref-cli");
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function usage() {
+  process.stdout.write(`Usage:
+  crossref-csl bibliography [options] DOI...
+  crossref-csl citation [options] DOI...
+  crossref-csl --mode bibliography DOI...
+  crossref-stq refs.txt | crossref-csl bibliography --style ieee
+  crossref-csl --list-styles
+
+Modes:
+  bibliography    Render a bibliography from one or more DOIs
+  citation        Render an in-text citation cluster from one or more DOIs
+
+Options:
+  --mode NAME      bibliography | citation
+  --style NAME     CSL style name. Default: apa
+  --style-file P   Path to a local .csl file
+  --locale NAME    CSL locale. Default: en-US
+  --output NAME    text | html. Default: text
+  --search-style K Search supported CSL style names by keyword
+  --show-styles N  Show the first N CSL style names
+  --list-styles    Print supported CSL style names from Crossref
+  -h, --help       Show this help
+`);
+}
+
+function fail(message) {
+  process.stderr.write(`${message}\n`);
+  process.exit(1);
+}
+
+function unique(values) {
+  return [...new Set(values.filter(Boolean))];
+}
+
+function trim(value) {
+  return value.trim();
+}
+
+function encodeFilePart(value) {
+  return encodeURIComponent(value).replace(/%/g, "_");
+}
+
+async function fetchText(url, headers = {}) {
+  let lastStatus = 0;
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const response = await fetch(url, {
+      headers: {
+        "User-Agent": USER_AGENT,
+        ...headers,
+      },
+      redirect: "follow",
+    });
+    if (response.ok) {
+      return await response.text();
+    }
+
+    lastStatus = response.status;
+    if (![429, 500, 502, 503, 504].includes(response.status) || attempt === 2) {
+      throw new Error(`HTTP ${response.status} for ${url}`);
+    }
+
+    const retryAfter = response.headers.get("retry-after");
+    const waitMs = retryAfter ? Number.parseInt(retryAfter, 10) * 1000 : 500 * (attempt + 1);
+    await sleep(Number.isFinite(waitMs) && waitMs > 0 ? waitMs : 500 * (attempt + 1));
+  }
+  throw new Error(`HTTP ${lastStatus} for ${url}`);
+}
+
+async function ensureDir(dirPath) {
+  await fsp.mkdir(dirPath, { recursive: true });
+}
+
+async function readCachedOrFetch(filePath, loader) {
+  try {
+    return await fsp.readFile(filePath, "utf8");
+  } catch (error) {
+    if (error && error.code !== "ENOENT") {
+      throw error;
+    }
+  }
+  const contents = await loader();
+  await ensureDir(path.dirname(filePath));
+  await fsp.writeFile(filePath, contents, "utf8");
+  return contents;
+}
+
+async function getStyleXml(styleName, styleFilePath) {
+  if (styleFilePath) {
+    return await fsp.readFile(styleFilePath, "utf8");
+  }
+
+  const cachePath = path.join(CACHE_DIR, "styles", `${encodeFilePart(styleName)}.csl`);
+  return await readCachedOrFetch(cachePath, async () => {
+    const url = `${STYLE_BASE_URL}/${encodeURIComponent(styleName)}.csl`;
+    return await fetchText(url);
+  });
+}
+
+function localeCandidates(locale) {
+  const raw = trim(locale);
+  const lower = raw.toLowerCase();
+  const exactNormalized = raw.includes("-")
+    ? `${raw.split("-")[0].toLowerCase()}-${raw.split("-").slice(1).join("-").toUpperCase()}`
+    : lower;
+
+  return unique([
+    raw,
+    exactNormalized,
+    lower === "us" ? "en-US" : "",
+    lower === "en" ? "en-US" : "",
+    raw.includes("-") ? raw.split("-")[0].toLowerCase() : "",
+    "en-US",
+  ]);
+}
+
+async function getLocaleXml(locale) {
+  let lastError = null;
+  for (const candidate of localeCandidates(locale)) {
+    const cachePath = path.join(CACHE_DIR, "locales", `${encodeFilePart(candidate)}.xml`);
+    try {
+      return await readCachedOrFetch(cachePath, async () => {
+        const url = `${LOCALE_BASE_URL}/locales-${encodeURIComponent(candidate)}.xml`;
+        return await fetchText(url);
+      });
+    } catch (error) {
+      lastError = error;
+    }
+  }
+  throw lastError || new Error(`Unable to load locale: ${locale}`);
+}
+
+async function fetchCslJsonForDoi(doi) {
+  const cachePath = path.join(CACHE_DIR, "items", `${encodeFilePart(doi)}.json`);
+  const payload = await readCachedOrFetch(cachePath, async () => {
+    const url = `${DOI_BASE_URL}/${encodeURIComponent(doi)}`;
+    return await fetchText(url, {
+      Accept: "application/vnd.citationstyles.csl+json",
+    });
+  });
+  const item = JSON.parse(payload);
+  item.id = doi;
+  return item;
+}
+
+function buildSys(itemsById, localeLoader) {
+  return {
+    retrieveItem(id) {
+      return itemsById[id];
+    },
+    retrieveLocale(lang) {
+      return localeLoader(lang);
+    },
+  };
+}
+
+async function renderBibliography({ processor, itemIds, output }) {
+  processor.updateItems(itemIds);
+  const result = processor.makeBibliography();
+  const params = result[0];
+  const entries = result[1];
+
+  if (output === "html") {
+    return `${params.bibstart}${entries.join("\n")}${params.bibend}`;
+  }
+  return entries.join("\n");
+}
+
+async function renderCitation({ processor, itemIds, output }) {
+  processor.updateItems(itemIds);
+  const citation = {
+    citationID: "citation-1",
+    citationItems: itemIds.map((id) => ({ id })),
+    properties: {
+      noteIndex: 0,
+    },
+  };
+  return processor.previewCitationCluster(citation, [], [], output);
+}
+
+async function listStyles() {
+  const payload = await fetchText(STYLES_LIST_URL);
+  const json = JSON.parse(payload);
+  const items = json && json.message && json.message.items ? json.message.items : [];
+  return items;
+}
+
+async function readDoisFromStdinIfNeeded(existingDois) {
+  if (existingDois.length > 0 || process.stdin.isTTY) {
+    return existingDois;
+  }
+
+  const chunks = [];
+  for await (const chunk of process.stdin) {
+    chunks.push(chunk);
+  }
+  const text = chunks.join("");
+  return text
+    .split(/\r?\n/)
+    .map(trim)
+    .filter(Boolean);
+}
+
+async function main() {
+  let mode = "";
+  let style = "apa";
+  let styleFilePath = "";
+  let locale = "en-US";
+  let output = "text";
+  let listStylesFlag = false;
+  let searchStyle = "";
+  let showStyles = "";
+  const dois = [];
+
+  const args = process.argv.slice(2);
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index];
+    switch (arg) {
+      case "bibliography":
+      case "citation":
+        if (mode) {
+          fail("Only one mode can be specified.");
+        }
+        mode = arg;
+        break;
+      case "--mode":
+        mode = args[index + 1] || "";
+        if (!mode) {
+          fail("--mode requires a value");
+        }
+        index += 1;
+        break;
+      case "--style":
+        style = args[index + 1] || "";
+        if (!style) {
+          fail("--style requires a value");
+        }
+        index += 1;
+        break;
+      case "--style-file":
+        styleFilePath = args[index + 1] || "";
+        if (!styleFilePath) {
+          fail("--style-file requires a value");
+        }
+        index += 1;
+        break;
+      case "--locale":
+        locale = args[index + 1] || "";
+        if (!locale) {
+          fail("--locale requires a value");
+        }
+        index += 1;
+        break;
+      case "--output":
+        output = args[index + 1] || "";
+        if (!output) {
+          fail("--output requires a value");
+        }
+        index += 1;
+        break;
+      case "--list-styles":
+        listStylesFlag = true;
+        break;
+      case "--search-style":
+        searchStyle = args[index + 1] || "";
+        if (!searchStyle) {
+          fail("--search-style requires a value");
+        }
+        index += 1;
+        break;
+      case "--show-styles":
+        showStyles = args[index + 1] || "";
+        if (!showStyles) {
+          fail("--show-styles requires a value");
+        }
+        index += 1;
+        break;
+      case "-h":
+      case "--help":
+        usage();
+        return;
+      default:
+        if (arg.startsWith("-")) {
+          fail(`Unknown option: ${arg}`);
+        }
+        dois.push(arg);
+        break;
+    }
+  }
+
+  if (listStylesFlag) {
+    const items = await listStyles();
+    process.stdout.write(`${items.join("\n")}\n`);
+    return;
+  }
+
+  if (searchStyle) {
+    const items = await listStyles();
+    const keyword = searchStyle.toLowerCase();
+    const matches = items.filter((item) => item.toLowerCase().includes(keyword));
+    process.stdout.write(matches.length ? `${matches.join("\n")}\n` : "");
+    return;
+  }
+
+  if (showStyles) {
+    if (!/^[1-9][0-9]*$/.test(showStyles)) {
+      fail("--show-styles requires an integer greater than 0");
+    }
+    const items = await listStyles();
+    process.stdout.write(`${items.slice(0, Number.parseInt(showStyles, 10)).join("\n")}\n`);
+    return;
+  }
+
+  if (!mode) {
+    fail("No mode provided. Use bibliography or citation.");
+  }
+  if (!["bibliography", "citation"].includes(mode)) {
+    fail("Unsupported mode. Use bibliography or citation.");
+  }
+  if (!["text", "html"].includes(output)) {
+    fail("Unsupported output. Use text or html.");
+  }
+
+  const finalDois = await readDoisFromStdinIfNeeded(dois);
+  if (finalDois.length === 0) {
+    fail("No DOI provided.");
+  }
+
+  const normalizedDois = finalDois.map(trim).filter(Boolean);
+  const uniqueDois = unique(normalizedDois);
+  const items = await Promise.all(uniqueDois.map((doi) => fetchCslJsonForDoi(doi)));
+  const itemsById = Object.fromEntries(items.map((item) => [item.id, item]));
+
+  let localeCache = new Map();
+  const localeLoader = (lang) => {
+    if (!localeCache.has(lang)) {
+      throw new Error(
+        `Locale ${lang} was requested before preload. This renderer expects locales to be preloaded.`
+      );
+    }
+    return localeCache.get(lang);
+  };
+
+  const styleXml = await getStyleXml(style, styleFilePath);
+  const localeNamesToPreload = unique([...localeCandidates(locale), "en", "en-US", "us"]);
+  const localeXmlByName = new Map();
+  for (const localeName of localeNamesToPreload) {
+    localeXmlByName.set(localeName, await getLocaleXml(localeName));
+  }
+  for (const [localeName, localeXml] of localeXmlByName.entries()) {
+    localeCache.set(localeName, localeXml);
+  }
+
+  const processor = new CSL.Engine(buildSys(itemsById, localeLoader), styleXml, locale, true);
+  processor.setOutputFormat(output);
+
+  const rendered =
+    mode === "bibliography"
+      ? await renderBibliography({ processor, itemIds: uniqueDois, output })
+      : await renderCitation({ processor, itemIds: normalizedDois, output });
+
+  process.stdout.write(`${rendered}\n`);
+}
+
+main().catch((error) => {
+  fail(error instanceof Error ? error.message : String(error));
+});
