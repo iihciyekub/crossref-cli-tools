@@ -2,7 +2,7 @@
 
 面向 Crossref 的轻量命令行工具集。
 
-项目现在稳定分成三条链路：
+项目现在稳定分成四条链路：
 
 - `crossref-stq`
   参考文献文本 -> DOI
@@ -10,6 +10,8 @@
   DOI -> 格式化文本 / 元数据 / 批量导出文件
 - `crossref-csl`
   DOI -> citation / bibliography / HTML
+- `doi-pdf`
+  DOI -> 按可配置下载源抓取 PDF
 
 设计原则：
 
@@ -23,6 +25,7 @@
 - [crossref-stq](/Users/iipro/iiworkspace/crossrefCLI/crossref-stq)
 - [crossref-doi](/Users/iipro/iiworkspace/crossrefCLI/crossref-doi)
 - [crossref-csl](/Users/iipro/iiworkspace/crossrefCLI/crossref-csl)
+- [doi-pdf](/Users/iipro/iiworkspace/crossrefCLI/doi-pdf)
 - [check](/Users/iipro/iiworkspace/crossrefCLI/check)
 - [README.md](/Users/iipro/iiworkspace/crossrefCLI/README.md)
 
@@ -33,7 +36,7 @@
 - `curl`
 - `perl`
 
-`crossref-csl` 需要：
+`crossref-csl` 和 `doi-pdf` 需要：
 
 - `node`
 - `npm`
@@ -47,7 +50,7 @@ npm install
 给脚本执行权限：
 
 ```bash
-chmod +x ./crossref-stq ./crossref-doi ./crossref-csl ./check
+chmod +x ./crossref-stq ./crossref-doi ./crossref-csl ./doi-pdf ./check
 ```
 
 ## 快速开始
@@ -68,6 +71,18 @@ DOI 渲染 bibliography：
 
 ```bash
 ./crossref-csl bibliography 10.1126/science.1157784
+```
+
+配置下载源后按 DOI 下载 PDF：
+
+```bash
+./doi-pdf --source 'https://example.org/{doi}' 10.1126/science.1157784
+```
+
+第一次初始化全局配置：
+
+```bash
+./doi-pdf --init-config --source 'https://example.org/{doi}'
 ```
 
 串联使用：
@@ -293,6 +308,94 @@ printf '%s\n' 10.1126/science.1157784 10.1038/nphys1170 | ./crossref-csl bibliog
 - 样式、locale、DOI 对应的 CSL JSON 会缓存到本地
 - 样式名拼错时，会给出候选建议
 
+### `doi-pdf`
+
+用途：
+
+- 输入一个或多个 DOI
+- 访问你配置的下载源
+- 从页面里查找 PDF 链接并保存到目录
+- 最终在 stdout 输出成功下载的 DOI JSON 数组
+
+最常用：
+
+```bash
+./doi-pdf --source 'https://example.org/{doi}' 10.1126/science.1157784
+./doi-pdf --source 'https://example.org/{doi_encoded}' 10.1126/science.1157784
+printf '%s\n' 10.1126/science.1157784 10.1038/nphys1170 | ./doi-pdf --source 'https://example.org/'
+```
+
+配置文件：
+
+```json
+{
+  "source": "https://example.org/{doi}",
+  "outputDir": "papers",
+  "maxConcurrency": 2
+}
+```
+
+默认配置文件路径：
+
+```text
+~/.config/crossref-cli/doi-pdf.json
+```
+
+第一次安装时最简单的方式：
+
+```bash
+./doi-pdf --init-config --source 'https://example.org/{doi}'
+./doi-pdf --print-config
+```
+
+这会把配置写到：
+
+```text
+~/.config/crossref-cli/doi-pdf.json
+```
+
+如果后面想重写这份配置：
+
+```bash
+./doi-pdf --init-config --source 'https://example.org/{doi}' --force
+```
+
+也可以显式指定：
+
+```bash
+./doi-pdf --config /path/to/doi-pdf.json 10.1126/science.1157784
+./doi-pdf --print-config
+```
+
+输出目录和并发：
+
+```bash
+./doi-pdf --source 'https://example.org/{doi}' --out out/papers --concurrency 2 10.1126/science.1157784
+```
+
+帮助：
+
+```bash
+./doi-pdf --help
+./doi-pdf --version
+```
+
+说明：
+
+- 不内置默认下载源，必须通过 `--source`、环境变量或配置文件提供
+- `--init-config` 必须显式传 `--source`，然后才会创建全局配置文件
+- 如果配置文件已存在，可配合 `--force` 覆盖
+- `source` 可以是基地址，也可以是带 `{doi}` / `{doi_encoded}` 的 URL 模板
+- 如果 `source` 不含占位符，行为就是 `source + DOI`
+- 默认输出目录是当前目录下的 `papers`
+- 默认并发是 `3`，最大也是 `3`
+- 下载源返回的内容需要满足以下任一条件：
+  - 直接返回 PDF
+  - HTML 中包含 `citation_pdf_url`
+  - HTML 中存在指向 PDF / download 的 `a` 或 `iframe`
+- `stderr` 会打印下载成功或跳过原因
+- `stdout` 只打印成功 DOI 的 JSON 数组
+
 ## 常见工作流
 
 只有参考文献文本，先找 DOI 再渲染 bibliography：
@@ -321,6 +424,12 @@ printf '%s\n' 10.1126/science.1157784 10.1038/nphys1170 | ./crossref-csl bibliog
 ./crossref-csl bibliography 10.1126/science.1157784 --output html --out out/bibliography.html
 ```
 
+通过可配置下载源批量抓 PDF：
+
+```bash
+printf '%s\n' 10.1126/science.1157784 10.1038/nphys1170 | ./doi-pdf --source 'https://example.org/{doi}' --out out/papers
+```
+
 ## 网络与缓存配置
 
 为了保持脚本简单，项目统一采用少量环境变量。
@@ -340,6 +449,16 @@ Node CLI 额外可用：
   `crossref-csl` 单次请求超时，默认 `60000`
 - `CROSSREFCLI_CACHE_DIR`
   缓存目录
+- `DOI2PDF_SOURCE_URL`
+  `doi-pdf` 的下载源
+- `DOI2PDF_BASE_URL`
+  `DOI2PDF_SOURCE_URL` 的兼容别名
+- `DOI2PDF_OUTPUT_DIR`
+  `doi-pdf` 输出目录
+- `DOI2PDF_MAX_CONCURRENCY`
+  `doi-pdf` 并发数
+- `DOI2PDF_CONFIG`
+  `doi-pdf` 配置文件路径
 
 示例：
 
@@ -349,6 +468,9 @@ export CROSSREFCLI_CONNECT_TIMEOUT=10
 export CROSSREFCLI_MAX_TIME=60
 export CROSSREFCLI_FETCH_TIMEOUT_MS=60000
 export CROSSREFCLI_CACHE_DIR="$HOME/.cache/crossref-cli"
+export DOI2PDF_SOURCE_URL='https://example.org/{doi}'
+export DOI2PDF_OUTPUT_DIR='papers'
+export DOI2PDF_MAX_CONCURRENCY=2
 ```
 
 默认缓存目录：
@@ -367,8 +489,8 @@ export CROSSREFCLI_CACHE_DIR="$HOME/.cache/crossref-cli"
 
 它会检查：
 
-- 三个 CLI 的 `--help`
-- 三个 CLI 的 `--version`
+- 四个 CLI 的 `--help`
+- 四个 CLI 的 `--version`
 - `crossref-stq` 是否能返回 DOI
 - `crossref-doi` 是否能返回格式化文本
 - `crossref-doi` 是否能处理多 DOI
@@ -377,6 +499,7 @@ export CROSSREFCLI_CACHE_DIR="$HOME/.cache/crossref-cli"
 - `crossref-csl` 是否能处理 citation 细节参数
 - `crossref-csl` 是否能返回 bibliography
 - `crossref-csl` 是否能输出文件
+- `doi-pdf` 是否能解析帮助和配置输出
 
 ## 什么时候用哪个命令
 
@@ -391,3 +514,7 @@ export CROSSREFCLI_CACHE_DIR="$HOME/.cache/crossref-cli"
 如果你已经有 DOI，需要 citation / bibliography / HTML 渲染：
 
 - 用 `crossref-csl`
+
+如果你已经有 DOI，并且想通过自定义下载源抓 PDF：
+
+- 用 `doi-pdf`

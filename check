@@ -22,50 +22,68 @@ need_cmd npm
 
 cd "$ROOT_DIR"
 
-echo "[1/10] help output"
+echo "[1/13] help output"
 ./crossref-stq --help >/dev/null
 ./crossref-doi --help >/dev/null
 ./crossref-csl --help >/dev/null
+./doi-pdf --help >/dev/null
 ./crossref-stq --version >/dev/null
 ./crossref-doi --version >/dev/null
 ./crossref-csl --version >/dev/null
+./doi-pdf --version >/dev/null
 
-echo "[2/10] install node dependency"
+echo "[2/13] doi-pdf config output"
+doi_pdf_config_output="$(./doi-pdf --source 'https://example.org/{doi}' --print-config)"
+printf '%s\n' "$doi_pdf_config_output" | grep -q '"source": "https://example.org/{doi}"'
+
+echo "[3/13] doi-pdf init config"
+./doi-pdf --config "$TMP_DIR/doi-pdf.json" --source 'https://example.org/{doi_encoded}' --out papers --concurrency 2 --init-config >/dev/null 2>&1
+grep -q '"source": "https://example.org/{doi_encoded}"' "$TMP_DIR/doi-pdf.json"
+grep -q '"outputDir": "papers"' "$TMP_DIR/doi-pdf.json"
+grep -q '"maxConcurrency": 2' "$TMP_DIR/doi-pdf.json"
+
+echo "[4/13] doi-pdf init config requires explicit source"
+if ./doi-pdf --config "$TMP_DIR/doi-pdf-missing-source.json" --init-config >/dev/null 2>&1; then
+  echo "doi-pdf init-config unexpectedly succeeded without --source" >&2
+  exit 1
+fi
+
+echo "[5/13] install node dependency"
 npm install >/dev/null
 
-echo "[3/10] STQ returns a DOI"
+echo "[6/13] STQ returns a DOI"
 stq_output="$(
   printf '%s\n' 'Boucher RC (2004) New concepts of the pathogenesis of cystic fibrosis lung disease. Eur Resp J 23: 146-158.' \
     | ./crossref-stq
 )"
 printf '%s\n' "$stq_output" | grep -q '^https://doi.org/'
 
-echo "[4/10] DOI text retrieval"
+echo "[7/13] DOI text retrieval"
 doi_text_output="$(./crossref-doi "$DOI_SAMPLE_1" --style apa)"
 printf '%s\n' "$doi_text_output" | grep -q 'Strategic Reading'
 
-echo "[5/10] DOI multiple input"
+echo "[8/13] DOI multiple input"
 doi_multi_output="$(printf '%s\n' "$DOI_SAMPLE_1" "$DOI_SAMPLE_2" | ./crossref-doi --format text)"
 printf '%s\n' "$doi_multi_output" | grep -q 'Strategic Reading'
 
-echo "[6/10] DOI file output"
+echo "[9/13] DOI file output"
 ./crossref-doi "$DOI_SAMPLE_1" "$DOI_SAMPLE_2" --format ris --out "$TMP_DIR/out" >/dev/null 2>&1
 test -f "$TMP_DIR/out/10.1126_science.1157784.ris"
 test -f "$TMP_DIR/out/10.1038_nphys1170.ris"
 
-echo "[7/10] CSL citation rendering"
+echo "[10/13] CSL citation rendering"
 csl_citation_output="$(./crossref-csl citation "$DOI_SAMPLE_1" --style apa)"
 printf '%s\n' "$csl_citation_output" | grep -q '('
 
-echo "[8/10] CSL citation details"
+echo "[11/13] CSL citation details"
 csl_citation_detail_output="$(./crossref-csl citation "$DOI_SAMPLE_1" --style apa --locator '12' --prefix 'see' --suffix 'for discussion')"
 printf '%s\n' "$csl_citation_detail_output" | grep -q '12'
 
-echo "[9/10] CSL bibliography rendering"
+echo "[12/13] CSL bibliography rendering"
 csl_bibliography_output="$(./crossref-csl bibliography "$DOI_SAMPLE_1" "$DOI_SAMPLE_2" --style ieee)"
 printf '%s\n' "$csl_bibliography_output" | grep -q '\[1\]'
 
-echo "[10/10] CSL file output"
+echo "[13/13] CSL file output"
 ./crossref-csl bibliography "$DOI_SAMPLE_1" --output html --out "$TMP_DIR/bibliography.html" >/dev/null 2>&1
 test -f "$TMP_DIR/bibliography.html"
 grep -q '<div class="csl-bib-body">' "$TMP_DIR/bibliography.html"

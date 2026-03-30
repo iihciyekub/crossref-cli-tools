@@ -1,0 +1,557 @@
+#!/usr/bin/env node
+
+const fs = require("fs");
+const os = require("os");
+const path = require("path");
+
+const VERSION = readVersion();
+const DOI_REGEX = /10\.\d{4,9}\/[-._;()/:A-Z0-9]+/i;
+const DEFAULT_MAX_CONCURRENCY = 3;
+const DEFAULT_OUTPUT_DIR = "papers";
+const DEFAULT_CONFIG_PATH = path.join(os.homedir(), ".config", "crossref-cli", "doi-pdf.json");
+
+function readVersion() {
+    try {
+        const packagePath = path.join(__dirname, "package.json");
+        return JSON.parse(fs.readFileSync(packagePath, "utf8")).version || "0.0.0";
+    } catch {
+        return "0.0.0";
+    }
+}
+
+function usage() {
+    return `doi-pdf ${VERSION}
+
+Usage:
+  ./doi-pdf [options] <doi> [doi ...]
+  printf '%s\\n' <doi> | ./doi-pdf [options]
+
+Options:
+  --source URL        Download source base URL or URL template.
+                      If the value contains {doi} or {doi_encoded},
+                      the placeholder will be replaced directly.
+  --config FILE       Read configuration from JSON file.
+  --out DIR           Save PDFs into DIR. Default: ./papers
+  --concurrency N     Parallel downloads. Default: 3, max: 3
+  --init-config       Create the JSON config file and exit.
+                      Requires an explicit --source value.
+  --force             Overwrite config file when used with --init-config.
+  --print-config      Print the resolved configuration as JSON and exit.
+  --help              Show this help text.
+  --version           Show version.
+
+Configuration priority:
+  1. CLI options
+  2. Environment variables
+  3. JSON config file
+  4. Built-in defaults
+
+Environment variables:
+  DOI2PDF_SOURCE_URL
+  DOI2PDF_BASE_URL    Legacy alias for DOI2PDF_SOURCE_URL
+  DOI2PDF_OUTPUT_DIR
+  DOI2PDF_MAX_CONCURRENCY
+  DOI2PDF_CONFIG
+
+Config file example:
+  {
+    "source": "https://example.org/{doi}",
+    "outputDir": "papers",
+    "maxConcurrency": 2
+  }
+`;
+}
+
+function fail(message) {
+    console.error(message);
+    process.exit(1);
+}
+
+function parseArgs(argv) {
+    const options = {
+        dois: [],
+        source: null,
+        configPath: null,
+        outputDir: null,
+        concurrency: null,
+        initConfig: false,
+        force: false,
+        printConfig: false,
+        help: false,
+        version: false,
+    };
+
+    for (let index = 0; index < argv.length; index += 1) {
+        const current = argv[index];
+
+        if (current === "--") {
+            options.dois.push(...argv.slice(index + 1));
+            break;
+        }
+
+        if (current === "--help" || current === "-h") {
+            options.help = true;
+            continue;
+        }
+
+        if (current === "--version") {
+            options.version = true;
+            continue;
+        }
+
+        if (current === "--print-config") {
+            options.printConfig = true;
+            continue;
+        }
+
+        if (current === "--init-config") {
+            options.initConfig = true;
+            continue;
+        }
+
+        if (current === "--force") {
+            options.force = true;
+            continue;
+        }
+
+        if (current === "--source") {
+            index += 1;
+            options.source = requireValue(argv[index], "--source");
+            continue;
+        }
+
+        if (current === "--config") {
+            index += 1;
+            options.configPath = requireValue(argv[index], "--config");
+            continue;
+        }
+
+        if (current === "--out") {
+            index += 1;
+            options.outputDir = requireValue(argv[index], "--out");
+            continue;
+        }
+
+        if (current === "--concurrency") {
+            index += 1;
+            options.concurrency = parsePositiveInteger(requireValue(argv[index], "--concurrency"), "--concurrency");
+            continue;
+        }
+
+        if (current.startsWith("--")) {
+            fail(`Unknown option: ${current}`);
+        }
+
+        options.dois.push(current);
+    }
+
+    return options;
+}
+
+function requireValue(value, flag) {
+    if (!value) {
+        fail(`Missing value for ${flag}`);
+    }
+
+    return value;
+}
+
+function parsePositiveInteger(value, label) {
+    const parsed = Number.parseInt(String(value), 10);
+    if (!Number.isFinite(parsed) || parsed <= 0) {
+        fail(`Invalid value for ${label}: ${value}`);
+    }
+
+    return parsed;
+}
+
+async function loadConfig(configPath, options = {}) {
+    const allowMissing = Boolean(options.allowMissing);
+    const resolvedPath = path.resolve(configPath || process.env.DOI2PDF_CONFIG || DEFAULT_CONFIG_PATH);
+    const explicit = Boolean(configPath || process.env.DOI2PDF_CONFIG);
+
+    try {
+        const raw = await fs.promises.readFile(resolvedPath, "utf8");
+        const parsed = JSON.parse(raw);
+        if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+            throw new Error("Config must be a JSON object");
+        }
+
+        return { config: parsed, path: resolvedPath };
+    } catch (error) {
+        if (error.code === "ENOENT" && (!explicit || allowMissing)) {
+            return { config: {}, path: resolvedPath };
+        }
+
+        throw new Error(`Failed to read config ${resolvedPath}: ${error.message}`);
+    }
+}
+
+function resolveSettings(cliOptions, fileConfig) {
+    const rawSource =
+        cliOptions.source ||
+        process.env.DOI2PDF_SOURCE_URL ||
+        process.env.DOI2PDF_BASE_URL ||
+        fileConfig.source ||
+        null;
+    const rawOutputDir = cliOptions.outputDir || process.env.DOI2PDF_OUTPUT_DIR || fileConfig.outputDir || DEFAULT_OUTPUT_DIR;
+    const rawConcurrency =
+        cliOptions.concurrency ||
+        parseOptionalPositiveInteger(process.env.DOI2PDF_MAX_CONCURRENCY) ||
+        parseOptionalPositiveInteger(fileConfig.maxConcurrency) ||
+        DEFAULT_MAX_CONCURRENCY;
+
+    return {
+        source: normalizeSource(rawSource),
+        outputDir: path.resolve(process.cwd(), rawOutputDir),
+        maxConcurrency: Math.min(rawConcurrency, DEFAULT_MAX_CONCURRENCY),
+    };
+}
+
+async function initConfigFile(cliOptions, configPath, settings) {
+    if (!cliOptions.source) {
+        throw new Error("--init-config requires an explicit --source value.");
+    }
+
+    const payload = {
+        source: normalizeSource(cliOptions.source),
+        outputDir: path.relative(process.cwd(), settings.outputDir) || ".",
+        maxConcurrency: settings.maxConcurrency,
+    };
+
+    const parentDir = path.dirname(configPath);
+    await fs.promises.mkdir(parentDir, { recursive: true });
+
+    if (!cliOptions.force) {
+        try {
+            await fs.promises.access(configPath, fs.constants.F_OK);
+            throw new Error(`Config already exists: ${configPath}. Re-run with --force to overwrite.`);
+        } catch (error) {
+            if (error.code !== "ENOENT") {
+                throw error;
+            }
+        }
+    }
+
+    await fs.promises.writeFile(configPath, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
+    console.error(`Wrote config to ${configPath}`);
+}
+
+function parseOptionalPositiveInteger(value) {
+    if (value === undefined || value === null || value === "") {
+        return null;
+    }
+
+    const parsed = Number.parseInt(String(value), 10);
+    if (!Number.isFinite(parsed) || parsed <= 0) {
+        return null;
+    }
+
+    return parsed;
+}
+
+function normalizeSource(value) {
+    if (!value) {
+        return null;
+    }
+
+    const trimmed = String(value).trim();
+    if (trimmed.length === 0) {
+        return null;
+    }
+
+    if (trimmed.includes("{doi}") || trimmed.includes("{doi_encoded}")) {
+        return trimmed;
+    }
+
+    return trimmed.endsWith("/") ? trimmed : `${trimmed}/`;
+}
+
+function extractDoiFromText(text) {
+    if (!text) {
+        return null;
+    }
+
+    const decoded = safeDecode(text);
+    const match = decoded.match(DOI_REGEX);
+    return match ? trimTrailingPunctuation(match[0]) : null;
+}
+
+function safeDecode(value) {
+    try {
+        return decodeURIComponent(value);
+    } catch {
+        return value;
+    }
+}
+
+function trimTrailingPunctuation(value) {
+    return value.replace(/[)\].,;]+$/g, "");
+}
+
+function filenameForDoi(doi) {
+    return `${doi.replaceAll("/", "_")}.pdf`;
+}
+
+function normalizeDoi(input) {
+    const doi = extractDoiFromText(input) || safeDecode(String(input || "")).trim();
+    return DOI_REGEX.test(doi) ? doi : null;
+}
+
+function buildPageUrl(source, doi) {
+    if (source.includes("{doi}") || source.includes("{doi_encoded}")) {
+        return source
+            .replaceAll("{doi_encoded}", encodeURIComponent(doi))
+            .replaceAll("{doi}", doi);
+    }
+
+    return `${source}${doi.replace(/^\/+/, "")}`;
+}
+
+function looksLikePdf(buffer) {
+    return buffer.length >= 4 && buffer.subarray(0, 4).toString("ascii") === "%PDF";
+}
+
+async function fetchText(url) {
+    const response = await fetch(url, {
+        redirect: "follow",
+        headers: {
+            "user-agent": "Mozilla/5.0 doi-pdf Downloader",
+            accept: "text/html,application/pdf;q=0.9,*/*;q=0.8",
+        },
+    });
+
+    if (!response.ok) {
+        throw new Error(`HTTP ${response.status}`);
+    }
+
+    return {
+        text: await response.text(),
+        finalUrl: response.url,
+        contentType: response.headers.get("content-type") || "",
+    };
+}
+
+function resolveUrl(candidate, baseUrl) {
+    try {
+        return new URL(candidate, baseUrl).href;
+    } catch {
+        return null;
+    }
+}
+
+function extractCandidatePdfUrls(html, baseUrl) {
+    const candidates = [];
+    const metaPatterns = [
+        /<meta[^>]+name=["']citation_pdf_url["'][^>]+content=["']([^"']+)["']/ig,
+        /<meta[^>]+content=["']([^"']+)["'][^>]+name=["']citation_pdf_url["']/ig,
+    ];
+
+    for (const pattern of metaPatterns) {
+        for (const match of html.matchAll(pattern)) {
+            const resolved = resolveUrl(match[1], baseUrl);
+            if (resolved) {
+                candidates.push(resolved);
+            }
+        }
+    }
+
+    for (const match of html.matchAll(/<(a|iframe)[^>]+(?:href|src)=["']([^"']+)["'][^>]*>/ig)) {
+        const raw = match[2];
+        const lower = raw.toLowerCase();
+        const looksPdf = lower.includes(".pdf") || lower.includes("/pdf") || lower.includes("download");
+        if (!looksPdf) {
+            continue;
+        }
+
+        const resolved = resolveUrl(raw, baseUrl);
+        if (resolved) {
+            candidates.push(resolved);
+        }
+    }
+
+    return [...new Set(candidates)];
+}
+
+async function findPdfUrl(pageUrl, expectedDoi) {
+    const page = await fetchText(pageUrl);
+    if (page.contentType.toLowerCase().includes("application/pdf")) {
+        return { pdfUrl: page.finalUrl, doi: expectedDoi || extractDoiFromText(page.finalUrl) };
+    }
+
+    const candidates = extractCandidatePdfUrls(page.text, page.finalUrl);
+    if (candidates.length === 0) {
+        throw new Error("No PDF link found");
+    }
+
+    const doi = expectedDoi || extractDoiFromText(page.finalUrl) || extractDoiFromText(pageUrl) || extractDoiFromText(page.text);
+    return { pdfUrl: candidates[0], doi };
+}
+
+async function downloadFile(fileUrl, outputPath) {
+    const response = await fetch(fileUrl, {
+        redirect: "follow",
+        headers: {
+            "user-agent": "Mozilla/5.0 doi-pdf Downloader",
+            accept: "application/pdf,*/*;q=0.8",
+        },
+    });
+
+    if (!response.ok) {
+        throw new Error(`HTTP ${response.status}`);
+    }
+
+    const arrayBuffer = await response.arrayBuffer();
+    const buffer = Buffer.from(arrayBuffer);
+    if (!looksLikePdf(buffer)) {
+        throw new Error("Response is not a PDF");
+    }
+
+    await fs.promises.writeFile(outputPath, buffer);
+    return outputPath;
+}
+
+async function downloadFromDoi(input, settings) {
+    const doi = normalizeDoi(input);
+    if (!doi) {
+        throw new Error("Invalid DOI");
+    }
+
+    const pageUrl = buildPageUrl(settings.source, doi);
+    const { pdfUrl, doi: resolvedDoi = doi } = await findPdfUrl(pageUrl, doi);
+    const outputPath = path.join(settings.outputDir, filenameForDoi(resolvedDoi));
+    await downloadFile(pdfUrl, outputPath);
+    return { doi: resolvedDoi, pdfUrl, outputPath };
+}
+
+async function runQueue(items, concurrency, worker) {
+    const results = new Array(items.length);
+    let nextIndex = 0;
+
+    async function consume() {
+        while (true) {
+            const currentIndex = nextIndex;
+            nextIndex += 1;
+            if (currentIndex >= items.length) {
+                return;
+            }
+
+            try {
+                results[currentIndex] = { ok: true, value: await worker(items[currentIndex], currentIndex) };
+            } catch (error) {
+                results[currentIndex] = { ok: false, error };
+            }
+        }
+    }
+
+    const workers = Array.from({ length: Math.min(concurrency, items.length) }, () => consume());
+    await Promise.all(workers);
+    return results;
+}
+
+async function readStdin() {
+    if (process.stdin.isTTY) {
+        return "";
+    }
+
+    return new Promise((resolve, reject) => {
+        let data = "";
+        process.stdin.setEncoding("utf8");
+        process.stdin.on("data", (chunk) => {
+            data += chunk;
+        });
+        process.stdin.on("end", () => resolve(data));
+        process.stdin.on("error", reject);
+    });
+}
+
+function gatherDoiInputs(argvDois, stdinText) {
+    const stdinDois = stdinText
+        .split(/\r?\n|[\s,]+/g)
+        .map((item) => item.trim())
+        .filter(Boolean);
+
+    return [...argvDois, ...stdinDois];
+}
+
+function printResolvedConfig(settings, configPath) {
+    console.log(
+        JSON.stringify(
+            {
+                source: settings.source,
+                outputDir: settings.outputDir,
+                maxConcurrency: settings.maxConcurrency,
+                configPath,
+            },
+            null,
+            2,
+        ),
+    );
+}
+
+async function main() {
+    const cliOptions = parseArgs(process.argv.slice(2));
+
+    if (cliOptions.help) {
+        console.log(usage());
+        return;
+    }
+
+    if (cliOptions.version) {
+        console.log(VERSION);
+        return;
+    }
+
+    const { config, path: configPath } = await loadConfig(cliOptions.configPath, {
+        allowMissing: cliOptions.initConfig,
+    });
+    const settings = resolveSettings(cliOptions, config);
+
+    if (cliOptions.initConfig) {
+        await initConfigFile(cliOptions, configPath, settings);
+        return;
+    }
+
+    if (cliOptions.printConfig) {
+        printResolvedConfig(settings, configPath);
+        return;
+    }
+
+    if (!settings.source) {
+        fail("No download source configured. Use --source, DOI2PDF_SOURCE_URL, DOI2PDF_BASE_URL, or a JSON config file.");
+    }
+
+    const stdinText = await readStdin();
+    const doiInputs = gatherDoiInputs(cliOptions.dois, stdinText);
+
+    if (doiInputs.length === 0) {
+        fail("Usage: ./doi-pdf [options] <doi> [doi ...]");
+    }
+
+    await fs.promises.mkdir(settings.outputDir, { recursive: true });
+
+    const queueResults = await runQueue(doiInputs, settings.maxConcurrency, async (doiInput) => {
+        const result = await downloadFromDoi(doiInput, settings);
+        console.error(`Downloaded ${result.doi} -> ${result.outputPath}`);
+        return result.doi;
+    });
+
+    const successDois = [];
+    queueResults.forEach((result, index) => {
+        if (result?.ok) {
+            successDois.push(result.value);
+            return;
+        }
+
+        const rawInput = doiInputs[index];
+        const message = result?.error?.message || "Unknown error";
+        console.error(`Skipped ${rawInput}: ${message}`);
+    });
+
+    console.log(JSON.stringify(successDois, null, 2));
+}
+
+main().catch((error) => {
+    console.error(error.message);
+    process.exit(1);
+});
