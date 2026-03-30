@@ -41,31 +41,39 @@ GitHub:
 - `node`
 - `npm`
 
-安装 Node 依赖：
+## 安装
 
-```bash
-npm install
-```
-
-发布后推荐安装方式：
+推荐全局安装：
 
 ```bash
 npm install -g crossref-cli-tools
 ```
 
-本地开发时的跨平台全局安装：
-
-```bash
-npm link
-```
-
-这样安装后可以在任意目录直接使用：
+安装后可直接在任意目录使用：
 
 ```bash
 crossref-stq --help
-crossref-doi 10.1126/science.1157784
-crossref-csl bibliography 10.1126/science.1157784
-doi-pdf --print-config
+crossref-doi --help
+crossref-csl --help
+doi-pdf --help
+```
+
+从 GitHub 下载并本地全局链接：
+
+```bash
+git clone https://github.com/iihciyekub/crossref-cli-tools.git
+cd crossref-cli-tools
+npm install
+npm link
+```
+
+只在当前仓库里本地运行：
+
+```bash
+git clone https://github.com/iihciyekub/crossref-cli-tools.git
+cd crossref-cli-tools
+npm install
+./crossref-doi 10.1126/science.1157784
 ```
 
 如果你更偏向本地脚本链接，也可以用：
