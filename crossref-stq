@@ -1,0 +1,332 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+BASE_URL="https://apps.crossref.org/SimpleTextQuery"
+USER_AGENT="crossref-stq-shell/0.1.0"
+
+usage() {
+  cat <<'EOF'
+Usage:
+  crossref-stq [options] [file]
+  crossref-stq --text "citation text"
+  cat refs.txt | crossref-stq --stdin
+
+Options:
+  --stdin         Read reference text from stdin
+  --text TEXT     Read reference text from a CLI argument
+  --include-pm    Ask Crossref to include PubMed IDs
+  --multi-hit     Ask Crossref to return all DOI candidates
+  --verbose       Print reference details instead of DOI-only output
+  --json          Print JSON
+  -h, --help      Show this help
+EOF
+}
+
+need_cmd() {
+  if ! command -v "$1" >/dev/null 2>&1; then
+    echo "Missing required command: $1" >&2
+    exit 1
+  fi
+}
+
+read_input() {
+  local use_stdin="$1"
+  local text_arg="$2"
+  local file_arg="$3"
+
+  if [[ -n "$text_arg" ]]; then
+    printf '%s' "$text_arg"
+    return
+  fi
+
+  if [[ "$use_stdin" == "1" ]]; then
+    cat
+    return
+  fi
+
+  if [[ -n "$file_arg" ]]; then
+    cat "$file_arg"
+    return
+  fi
+
+  if [[ ! -t 0 ]]; then
+    cat
+    return
+  fi
+
+  echo "No input provided. Use a file, --text, or --stdin." >&2
+  exit 1
+}
+
+main() {
+  need_cmd curl
+  need_cmd perl
+  need_cmd mktemp
+
+  local use_stdin=0
+  local text_arg=""
+  local include_pm=0
+  local multi_hit=0
+  local verbose_output=0
+  local json_output=0
+  local file_arg=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --stdin)
+        use_stdin=1
+        shift
+        ;;
+      --text)
+        text_arg="${2:-}"
+        if [[ -z "$text_arg" ]]; then
+          echo "--text requires a value" >&2
+          exit 1
+        fi
+        shift 2
+        ;;
+      --include-pm)
+        include_pm=1
+        shift
+        ;;
+      --multi-hit)
+        multi_hit=1
+        shift
+        ;;
+      --json)
+        json_output=1
+        shift
+        ;;
+      --verbose)
+        verbose_output=1
+        shift
+        ;;
+      -h|--help)
+        usage
+        exit 0
+        ;;
+      -*)
+        echo "Unknown option: $1" >&2
+        exit 1
+        ;;
+      *)
+        if [[ -n "$file_arg" ]]; then
+          echo "Only one input file is supported" >&2
+          exit 1
+        fi
+        file_arg="$1"
+        shift
+        ;;
+    esac
+  done
+
+  local input_text
+  input_text="$(read_input "$use_stdin" "$text_arg" "$file_arg")"
+  input_text="${input_text#"${input_text%%[![:space:]]*}"}"
+  input_text="${input_text%"${input_text##*[![:space:]]}"}"
+
+  if [[ -z "$input_text" ]]; then
+    echo "Input is empty." >&2
+    exit 1
+  fi
+
+  local tmpdir
+  tmpdir="$(mktemp -d)"
+  trap 'rm -rf "${tmpdir:-}"' EXIT
+
+  local page_file="$tmpdir/page.html"
+  local result_file="$tmpdir/result.html"
+  local input_file="$tmpdir/input.txt"
+  local cookie_file="$tmpdir/cookies.txt"
+
+  printf '%s' "$input_text" > "$input_file"
+
+  curl -sS \
+    -A "$USER_AGENT" \
+    -c "$cookie_file" \
+    "$BASE_URL" > "$page_file"
+
+  local form_key
+  form_key="$(
+    perl -0ne 'print $1 if /name="key"\s+value=\s*"([^"]*)"/i' "$page_file"
+  )"
+
+  if [[ -z "$form_key" ]]; then
+    echo "Failed to extract hidden form key." >&2
+    exit 1
+  fi
+
+  local -a curl_args
+  curl_args=(
+    -sS
+    -A "$USER_AGENT"
+    -b "$cookie_file"
+    -c "$cookie_file"
+    -X POST "$BASE_URL"
+    --data-urlencode "command=Submit"
+    --data-urlencode "key=$form_key"
+    --data-urlencode "freetext@$input_file"
+  )
+
+  if [[ "$include_pm" == "1" ]]; then
+    curl_args+=(--data-urlencode "includePM=on")
+  fi
+  if [[ "$multi_hit" == "1" ]]; then
+    curl_args+=(--data-urlencode "multihit=on")
+  fi
+
+  curl "${curl_args[@]}" > "$result_file"
+
+  if [[ "$json_output" == "1" ]]; then
+    perl -0ne '
+      use strict;
+      use warnings;
+      use JSON::PP;
+
+      my $html = $_;
+      my @rows;
+      while ($html =~ m{<tr class="resultB"><td class="resultB" colspan="4"[^>]*>(.*?)</td></tr>}sig) {
+        my $block = $1;
+        my @dois = ();
+        while ($block =~ m{<a\b[^>]*href="(https://doi\.org/[^"]+)"}sig) {
+          push @dois, $1 unless grep { $_ eq $1 } @dois;
+        }
+
+        my $pmid = undef;
+        if ($block =~ /PMid:\s*([0-9]+)/i) {
+          $pmid = $1;
+        }
+
+        my $text = $block;
+        $text =~ s{<br\s*/?>}{\n}ig;
+        $text =~ s{<a\b[^>]*>.*?</a>}{}sig;
+        $text =~ s{<[^>]+>}{}g;
+        $text =~ s/&nbsp;/ /g;
+        $text =~ s/\r//g;
+        my @lines = grep { length $_ } map {
+          my $v = $_;
+          $v =~ s/^\s+//;
+          $v =~ s/\s+$//;
+          $v =~ s/\s+/ /g;
+          $v;
+        } split /\n+/, $text;
+
+        my $reference = "";
+        for my $line (@lines) {
+          next if $line =~ /doi\.org\//i;
+          next if $line =~ /^PMid:/i;
+          $reference = $line;
+          last;
+        }
+
+        push @rows, {
+          reference => $reference,
+          dois => \@dois,
+          pmid => $pmid,
+        };
+      }
+
+      print JSON::PP->new->utf8->pretty->encode(\@rows);
+    ' "$result_file"
+    exit 0
+  fi
+
+  if [[ "$verbose_output" == "1" ]]; then
+    perl -0ne '
+      use strict;
+      use warnings;
+
+      my $html = $_;
+      my @blocks = ();
+      while ($html =~ m{<tr class="resultB"><td class="resultB" colspan="4"[^>]*>(.*?)</td></tr>}sig) {
+        push @blocks, $1;
+      }
+
+      if (!@blocks) {
+        print "No matches returned.\n";
+        exit 0;
+      }
+
+      my $index = 1;
+      for my $block (@blocks) {
+        my @dois = ();
+        while ($block =~ m{<a\b[^>]*href="(https://doi\.org/[^"]+)"}sig) {
+          push @dois, $1 unless grep { $_ eq $1 } @dois;
+        }
+
+        my $pmid = undef;
+        if ($block =~ /PMid:\s*([0-9]+)/i) {
+          $pmid = $1;
+        }
+
+        my $text = $block;
+        $text =~ s{<br\s*/?>}{\n}ig;
+        $text =~ s{<a\b[^>]*>.*?</a>}{}sig;
+        $text =~ s{<[^>]+>}{}g;
+        $text =~ s/&nbsp;/ /g;
+        $text =~ s/\r//g;
+        my @lines = grep { length $_ } map {
+          my $v = $_;
+          $v =~ s/^\s+//;
+          $v =~ s/\s+$//;
+          $v =~ s/\s+/ /g;
+          $v;
+        } split /\n+/, $text;
+
+        my $reference = "(empty reference)";
+        for my $line (@lines) {
+          next if $line =~ /doi\.org\//i;
+          next if $line =~ /^PMid:/i;
+          $reference = $line;
+          last;
+        }
+
+        print "[$index] $reference\n";
+        if (@dois) {
+          for my $doi (@dois) {
+            print "  DOI: $doi\n";
+          }
+        } else {
+          print "  DOI: (none)\n";
+        }
+        if (defined $pmid) {
+          print "  PMID: $pmid\n";
+        }
+        print "\n" if $index < scalar @blocks;
+        $index++;
+      }
+    ' "$result_file"
+    exit 0
+  fi
+
+  perl -0ne '
+    use strict;
+    use warnings;
+
+    my $html = $_;
+    my @blocks = ();
+    while ($html =~ m{<tr class="resultB"><td class="resultB" colspan="4"[^>]*>(.*?)</td></tr>}sig) {
+      push @blocks, $1;
+    }
+
+    if (!@blocks) {
+      print "No matches returned.\n";
+      exit 0;
+    }
+
+    for my $block (@blocks) {
+      my @dois = ();
+      while ($block =~ m{<a\b[^>]*href="(https://doi\.org/[^"]+)"}sig) {
+        push @dois, $1 unless grep { $_ eq $1 } @dois;
+      }
+      if (@dois) {
+        for my $doi (@dois) {
+          print "$doi\n";
+        }
+      }
+    }
+  ' "$result_file"
+}
+
+main "$@"
