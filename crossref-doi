@@ -1,0 +1,195 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+USER_AGENT="crossref-doi-shell/0.1.0"
+DOI_BASE_URL="https://doi.org"
+CROSSREF_API_BASE_URL="https://api.crossref.org"
+
+usage() {
+  cat <<'EOF'
+Usage:
+  crossref-doi [options] DOI
+  crossref-doi --doi DOI --format text --style apa
+  crossref-doi --list-styles
+
+Options:
+  --doi DOI        DOI to retrieve
+  --format NAME    text | bibtex | ris | csljson | json | unixref | unixsd
+                   Default: text
+  --style NAME     CSL style for --format text. Default: apa
+  --locale NAME    Locale for --format text. Default: en-US
+  --list-styles    Print supported CSL style names from Crossref
+  -h, --help       Show this help
+EOF
+}
+
+need_cmd() {
+  if ! command -v "$1" >/dev/null 2>&1; then
+    echo "Missing required command: $1" >&2
+    exit 1
+  fi
+}
+
+trim() {
+  local value="$1"
+  value="${value#"${value%%[![:space:]]*}"}"
+  value="${value%"${value##*[![:space:]]}"}"
+  printf '%s' "$value"
+}
+
+urlencode() {
+  perl -e '
+    use strict;
+    use warnings;
+    use bytes;
+
+    my $input = shift // q{};
+    for my $ch (split //, $input) {
+      if ($ch =~ /[A-Za-z0-9\-\._~]/) {
+        print $ch;
+      } else {
+        printf "%%%02X", ord($ch);
+      }
+    }
+  ' "$1"
+}
+
+main() {
+  need_cmd curl
+  need_cmd perl
+
+  local doi=""
+  local format="text"
+  local style="apa"
+  local locale="en-US"
+  local list_styles=0
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --doi)
+        doi="${2:-}"
+        if [[ -z "$doi" ]]; then
+          echo "--doi requires a value" >&2
+          exit 1
+        fi
+        shift 2
+        ;;
+      --format)
+        format="${2:-}"
+        if [[ -z "$format" ]]; then
+          echo "--format requires a value" >&2
+          exit 1
+        fi
+        shift 2
+        ;;
+      --style)
+        style="${2:-}"
+        if [[ -z "$style" ]]; then
+          echo "--style requires a value" >&2
+          exit 1
+        fi
+        shift 2
+        ;;
+      --locale)
+        locale="${2:-}"
+        if [[ -z "$locale" ]]; then
+          echo "--locale requires a value" >&2
+          exit 1
+        fi
+        shift 2
+        ;;
+      --list-styles)
+        list_styles=1
+        shift
+        ;;
+      -h|--help)
+        usage
+        exit 0
+        ;;
+      -*)
+        echo "Unknown option: $1" >&2
+        exit 1
+        ;;
+      *)
+        if [[ -n "$doi" ]]; then
+          echo "Only one DOI is supported" >&2
+          exit 1
+        fi
+        doi="$1"
+        shift
+        ;;
+    esac
+  done
+
+  if [[ "$list_styles" == "1" ]]; then
+    curl -sSL -A "$USER_AGENT" \
+      "${CROSSREF_API_BASE_URL}/v1/styles" \
+      | perl -0ne '
+          use strict;
+          use warnings;
+          use JSON::PP;
+
+          my $payload = decode_json($_);
+          my $items = $payload->{message}{items} // [];
+          print join("\n", @$items), "\n";
+        '
+    exit 0
+  fi
+
+  doi="$(trim "$doi")"
+  if [[ -z "$doi" ]]; then
+    echo "No DOI provided. Pass a DOI or use --list-styles." >&2
+    exit 1
+  fi
+
+  local accept_header=""
+  local url=""
+  local encoded_doi
+  encoded_doi="$(urlencode "$doi")"
+
+  case "$format" in
+    text)
+      accept_header="text/x-bibliography; style=${style}; locale=${locale}"
+      url="${DOI_BASE_URL}/${doi}"
+      ;;
+    bibtex)
+      accept_header="application/x-bibtex"
+      url="${DOI_BASE_URL}/${doi}"
+      ;;
+    ris)
+      accept_header="application/x-research-info-systems"
+      url="${DOI_BASE_URL}/${doi}"
+      ;;
+    csljson)
+      accept_header="application/vnd.citationstyles.csl+json"
+      url="${DOI_BASE_URL}/${doi}"
+      ;;
+    unixref)
+      accept_header="application/vnd.crossref.unixref+xml"
+      url="${DOI_BASE_URL}/${doi}"
+      ;;
+    unixsd)
+      accept_header="application/vnd.crossref.unixsd+xml"
+      url="${DOI_BASE_URL}/${doi}"
+      ;;
+    json)
+      url="${CROSSREF_API_BASE_URL}/works/${encoded_doi}"
+      ;;
+    *)
+      echo "Unsupported format: $format" >&2
+      echo "Supported formats: text, bibtex, ris, csljson, json, unixref, unixsd" >&2
+      exit 1
+      ;;
+  esac
+
+  if [[ -n "$accept_header" ]]; then
+    curl -sSL -A "$USER_AGENT" \
+      -H "Accept: ${accept_header}" \
+      "$url"
+  else
+    curl -sSL -A "$USER_AGENT" "$url"
+  fi
+}
+
+main "$@"

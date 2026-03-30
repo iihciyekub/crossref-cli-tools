@@ -1,4 +1,24 @@
-# crossref-stq
+# crossrefCLI
+
+两个最小化的 shell CLI：
+
+- `crossref-stq`：把参考文献文本批量匹配成 DOI
+- `crossref-doi`：通过 DOI 取格式化引用或元数据
+
+## 第一步和第二步
+
+当前先实现最轻的一步：
+
+1. `ref -> DOI`
+2. `DOI -> text / bibtex / ris / csljson / json / xml`
+
+后续如果要做：
+
+3. `CSL JSON -> citation / bibliography / HTML`
+
+那一步会单独加一个 CSL 渲染器，不混在当前轻量脚本里。
+
+## `crossref-stq`
 
 一个最小化的 shell CLI，用来调用 Crossref 的 [Simple Text Query](https://apps.crossref.org/SimpleTextQuery) 页面并简洁输出 DOI。
 
@@ -64,3 +84,75 @@ cat refs.txt | ./crossref-stq --stdin
 
 - `curl`
 - `perl`
+
+## `crossref-doi`
+
+一个最小化的 DOI CLI，用来通过官方接口获取格式化参考文献或结构化元数据。
+
+支持的输出：
+
+- `text`
+- `bibtex`
+- `ris`
+- `csljson`
+- `json`
+- `unixref`
+- `unixsd`
+
+### 用法
+
+默认输出 `text`，默认样式 `apa`：
+
+```bash
+./crossref-doi 10.1126/science.1157784
+```
+
+切换引用样式：
+
+```bash
+./crossref-doi 10.1126/science.1157784 --style ieee
+./crossref-doi 10.1126/science.1157784 --style mla
+./crossref-doi 10.1126/science.1157784 --style chicago-author-date
+```
+
+切换语言：
+
+```bash
+./crossref-doi 10.1126/science.1157784 --style apa --locale zh-CN
+```
+
+输出 RIS：
+
+```bash
+./crossref-doi 10.1126/science.1157784 --format ris
+```
+
+输出 BibTeX：
+
+```bash
+./crossref-doi 10.1126/science.1157784 --format bibtex
+```
+
+输出 CSL JSON：
+
+```bash
+./crossref-doi 10.1126/science.1157784 --format csljson
+```
+
+输出 Crossref REST JSON：
+
+```bash
+./crossref-doi 10.1126/science.1157784 --format json
+```
+
+查看可用样式名：
+
+```bash
+./crossref-doi --list-styles
+```
+
+### 说明
+
+- `--style` 和 `--locale` 只对 `--format text` 生效
+- `RIS` 通常可直接导入 EndNote
+- 这一步只做官方返回格式，不做 HTML citation 渲染
