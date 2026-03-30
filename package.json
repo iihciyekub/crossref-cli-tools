@@ -1,15 +1,41 @@
 {
   "name": "crossref-cli-tools",
-  "private": true,
   "version": "0.1.0",
   "description": "Lightweight Node-based Crossref CLIs for DOI lookup, metadata retrieval, CSL rendering, and PDF download",
   "license": "UNLICENSED",
+  "homepage": "https://github.com/iihciyekub/crossref-cli-tools#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/iihciyekub/crossref-cli-tools.git"
+  },
+  "bugs": {
+    "url": "https://github.com/iihciyekub/crossref-cli-tools/issues"
+  },
+  "keywords": [
+    "crossref",
+    "doi",
+    "citation",
+    "csl",
+    "bibliography",
+    "cli"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
   "bin": {
     "crossref-stq": "./crossref-stq",
     "crossref-doi": "./crossref-doi",
     "crossref-csl": "./crossref-csl",
     "doi-pdf": "./doi-pdf"
   },
+  "files": [
+    "README.md",
+    "crossref-stq",
+    "crossref-doi",
+    "crossref-csl",
+    "doi-pdf",
+    "lib"
+  ],
   "dependencies": {
     "citeproc": "^2.4.63"
   }

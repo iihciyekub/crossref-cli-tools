@@ -2,6 +2,10 @@
 
 面向 Crossref 的轻量命令行工具集。
 
+GitHub:
+
+- [iihciyekub/crossref-cli-tools](https://github.com/iihciyekub/crossref-cli-tools)
+
 项目现在稳定分成四条链路：
 
 - `crossref-stq`
@@ -43,7 +47,13 @@
 npm install
 ```
 
-跨平台全局安装：
+发布后推荐安装方式：
+
+```bash
+npm install -g crossref-cli-tools
+```
+
+本地开发时的跨平台全局安装：
 
 ```bash
 npm link
@@ -121,6 +131,22 @@ DOI 渲染 bibliography：
 ```bash
 crossref-doi 10.1126/science.1157784
 doi-pdf --print-config
+```
+
+## 发布准备
+
+当前 npm 包名 `crossref-cli-tools` 还没有被占用。GitHub 仓库已经创建好：
+
+- [iihciyekub/crossref-cli-tools](https://github.com/iihciyekub/crossref-cli-tools)
+
+正式发布到 npm 之前还需要你自己完成一件事：
+
+- 用你的 npm 账号执行 `npm login`，然后运行 `npm publish`
+
+发布前可先检查打包内容：
+
+```bash
+npm pack --dry-run
 ```
 
 ## 命令概览
