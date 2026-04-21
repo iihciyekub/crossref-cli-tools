@@ -312,20 +312,49 @@ npm install
 npm version patch
 ```
 
+推送代码并打 tag：
+
+```bash
+git push origin main
+git push origin vX.Y.Z
+```
+
+创建 GitHub Release 后，仓库里的 GitHub Actions 会自动：
+
+- `npm ci`
+- 运行 `./check`
+- 运行 `npm pack --dry-run`
+- 用 npm automation token 发布到 npm
+
+需要先在 GitHub 仓库里配置一个 secret：
+
+- `NPM_TOKEN`
+  这个值应当使用 npm 的 automation token
+
+推荐做法：
+
+1. 在 npm 网站创建 automation token
+2. 在 GitHub 仓库 Settings -> Secrets and variables -> Actions 中添加 `NPM_TOKEN`
+3. 创建并发布 GitHub Release
+
+如果需要手动补发，也可以在 GitHub Actions 里手动触发 `Publish to npm`
+
 预览打包内容：
 
 ```bash
 npm pack --dry-run
 ```
 
-发布到 npm：
+本地手动发布到 npm：
 
 ```bash
 npm login
 npm publish
 ```
 
-发布 GitHub 版本后，你也可以再创建对应 tag / release。
+自动发布 workflow 位于：
+
+- `.github/workflows/npm-publish.yml`
 
 ## 什么时候用哪个命令
 
