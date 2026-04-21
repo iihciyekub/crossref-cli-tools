@@ -3,6 +3,7 @@
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
+const { decodeHtmlEntities, fetchWithRetry } = require("./lib/node-cli-utils");
 
 const VERSION = readVersion();
 const DOI_REGEX = /10\.\d{4,9}\/[-._;()/:A-Z0-9]+/i;
@@ -25,12 +26,22 @@ function usage() {
 Usage:
   ./doi-pdf [options] <doi> [doi ...]
   printf '%s\\n' <doi> | ./doi-pdf [options]
+  ./doi-pdf --items items.json
+  cat items.jsonl | ./doi-pdf --stdin-json
+
+Input:
+  DOI values may also be DOI URLs such as https://doi.org/10.1000/xyz123
 
 Options:
   --source URL        Download source base URL or URL template.
                       If the value contains {doi} or {doi_encoded},
                       the placeholder will be replaced directly.
+                      The configured source is tried first, then
+                      doi.org resolution is used as a fallback.
   --config FILE       Read configuration from JSON file.
+  --items FILE        Read Zotero-style item JSON from FILE.
+                      Accepts a JSON object, a JSON array, or JSON Lines.
+  --stdin-json        Parse stdin as Zotero-style JSON / JSON Lines.
   --out DIR           Save PDFs into DIR. Default: ./papers
   --concurrency N     Parallel downloads. Default: 3, max: 3
   --init-config       Create the JSON config file and exit.
@@ -72,8 +83,10 @@ function parseArgs(argv) {
         dois: [],
         source: null,
         configPath: null,
+        itemsPath: null,
         outputDir: null,
         concurrency: null,
+        stdinJson: false,
         initConfig: false,
         force: false,
         printConfig: false,
@@ -126,6 +139,12 @@ function parseArgs(argv) {
             continue;
         }
 
+        if (current === "--items") {
+            index += 1;
+            options.itemsPath = requireValue(argv[index], "--items");
+            continue;
+        }
+
         if (current === "--out") {
             index += 1;
             options.outputDir = requireValue(argv[index], "--out");
@@ -135,6 +154,11 @@ function parseArgs(argv) {
         if (current === "--concurrency") {
             index += 1;
             options.concurrency = parsePositiveInteger(requireValue(argv[index], "--concurrency"), "--concurrency");
+            continue;
+        }
+
+        if (current === "--stdin-json") {
+            options.stdinJson = true;
             continue;
         }
 
@@ -293,9 +317,81 @@ function filenameForDoi(doi) {
     return `${doi.replaceAll("/", "_")}.pdf`;
 }
 
+function normalizeWhitespace(value) {
+    return String(value || "").replace(/\s+/g, " ").trim();
+}
+
+function cleanDoiCandidate(input) {
+    const decoded = normalizeWhitespace(safeDecode(String(input || "")));
+    if (!decoded) {
+        return "";
+    }
+
+    const trimmed = decoded
+        .replace(/^(?:doi\s*:|urn\s*:doi\s*:)\s*/i, "")
+        .replace(/^https?:\/\/(?:dx\.)?doi\.org\//i, "")
+        .replace(/^https?:\/\/[^/\s]+\/(?:article|doi|content\/pdf)\//i, "");
+
+    return trimTrailingPunctuation(trimmed);
+}
+
+function getFieldCaseInsensitive(item, name) {
+    if (!item || typeof item !== "object" || Array.isArray(item)) {
+        return null;
+    }
+
+    const lowered = String(name).toLowerCase();
+    for (const [key, value] of Object.entries(item)) {
+        if (String(key).toLowerCase() === lowered) {
+            return value;
+        }
+    }
+
+    return null;
+}
+
+function getDoiFromExtraField(extra) {
+    const text = typeof extra === "string"
+        ? extra
+        : Array.isArray(extra)
+            ? extra.join("\n")
+            : "";
+    const match = text.match(/^DOI:\s*(.+)$/im);
+    return match ? match[1].trim() : null;
+}
+
+function getDoiFromUrlField(url) {
+    const raw = typeof url === "string" ? url.trim() : "";
+    if (!raw || !/\bdoi\.org\b/i.test(raw)) {
+        return null;
+    }
+
+    try {
+        return decodeURIComponent(new URL(raw).pathname).replace(/^\/+/, "");
+    } catch {
+        return null;
+    }
+}
+
+function extractDoiFromItem(item) {
+    if (!item || typeof item !== "object" || Array.isArray(item)) {
+        return null;
+    }
+
+    const directDoi =
+        getFieldCaseInsensitive(item, "DOI") ||
+        getFieldCaseInsensitive(item, "doi");
+    const extraDoi = getDoiFromExtraField(getFieldCaseInsensitive(item, "extra"));
+    const urlDoi = getDoiFromUrlField(getFieldCaseInsensitive(item, "url"));
+
+    return normalizeDoi(directDoi) || normalizeDoi(extraDoi) || normalizeDoi(urlDoi);
+}
+
 function normalizeDoi(input) {
-    const doi = extractDoiFromText(input) || safeDecode(String(input || "")).trim();
-    return DOI_REGEX.test(doi) ? doi : null;
+    const cleaned = cleanDoiCandidate(input);
+    const extracted = extractDoiFromText(cleaned) || extractDoiFromText(input);
+    const doi = extracted || cleaned;
+    return DOI_REGEX.test(doi) ? doi.toLowerCase() : null;
 }
 
 function buildPageUrl(source, doi) {
@@ -312,24 +408,93 @@ function looksLikePdf(buffer) {
     return buffer.length >= 4 && buffer.subarray(0, 4).toString("ascii") === "%PDF";
 }
 
-async function fetchText(url) {
-    const response = await fetch(url, {
-        redirect: "follow",
-        headers: {
-            "user-agent": "Mozilla/5.0 doi-pdf Downloader",
-            accept: "text/html,application/pdf;q=0.9,*/*;q=0.8",
-        },
-    });
-
-    if (!response.ok) {
-        throw new Error(`HTTP ${response.status}`);
+function looksLikeHtml(buffer) {
+    if (!buffer || buffer.length === 0) {
+        return false;
     }
 
-    return {
-        text: await response.text(),
-        finalUrl: response.url,
-        contentType: response.headers.get("content-type") || "",
-    };
+    const head = buffer.subarray(0, Math.min(buffer.length, 512)).toString("utf8").trimStart().toLowerCase();
+    return head.startsWith("<!doctype html") || head.startsWith("<html") || head.startsWith("<head") || head.startsWith("<body");
+}
+
+function formatErrorMessage(error) {
+    if (!error) {
+        return "Unknown error";
+    }
+
+    const primaryMessage = typeof error.message === "string" && error.message.trim().length > 0
+        ? error.message.trim()
+        : String(error);
+    const parts = [primaryMessage];
+    const seen = new Set(parts);
+    let current = error.cause;
+    let depth = 0;
+
+    while (current && depth < 5) {
+        const details = [];
+        const causeMessage = typeof current.message === "string" ? current.message.trim() : "";
+        if (causeMessage && !seen.has(causeMessage)) {
+            details.push(causeMessage);
+            seen.add(causeMessage);
+        }
+
+        for (const extra of [current.code, current.hostname]) {
+            if (typeof extra !== "string" || extra.trim().length === 0) {
+                continue;
+            }
+
+            const normalized = extra.trim();
+            if (seen.has(normalized) || (causeMessage && causeMessage.includes(normalized))) {
+                continue;
+            }
+
+            details.push(normalized);
+            seen.add(normalized);
+        }
+
+        if (details.length > 0) {
+            parts.push(details.join(" "));
+        }
+
+        current = current.cause;
+        depth += 1;
+    }
+
+    return parts.join(": ");
+}
+
+async function fetchText(url) {
+    let response;
+    try {
+        response = await fetchWithRetry(url, {
+            redirect: "follow",
+            headers: {
+                "user-agent": "Mozilla/5.0 doi-pdf Downloader",
+                accept: "text/html,application/pdf;q=0.9,*/*;q=0.8",
+            },
+        });
+    } catch (error) {
+        throw new Error(`Failed to fetch page ${url}`, { cause: error });
+    }
+
+    const contentType = response.headers.get("content-type") || "";
+    if (contentType.toLowerCase().includes("application/pdf")) {
+        return {
+            text: "",
+            finalUrl: response.url,
+            contentType,
+        };
+    }
+
+    try {
+        return {
+            text: await response.text(),
+            finalUrl: response.url,
+            contentType,
+        };
+    } catch (error) {
+        throw new Error(`Failed to read response body from ${response.url}`, { cause: error });
+    }
 }
 
 function resolveUrl(candidate, baseUrl) {
@@ -340,37 +505,146 @@ function resolveUrl(candidate, baseUrl) {
     }
 }
 
-function extractCandidatePdfUrls(html, baseUrl) {
+function appendUniqueUrl(items, candidate, baseUrl) {
+    const decoded = decodeHtmlEntities(candidate);
+    const resolved = resolveUrl(decoded, baseUrl);
+    if (resolved && !items.includes(resolved)) {
+        items.push(resolved);
+    }
+}
+
+function hostMatches(url, pattern) {
+    try {
+        return pattern.test(new URL(url).hostname);
+    } catch {
+        return false;
+    }
+}
+
+function extractCanonicalDoiFromHandleResponse(payload) {
+    if (!payload || typeof payload !== "object") {
+        return null;
+    }
+
+    const directHandle = typeof payload.handle === "string" ? normalizeDoi(payload.handle) : null;
+    if (directHandle) {
+        return directHandle;
+    }
+
+    const values = Array.isArray(payload.values) ? payload.values : [];
+    for (const entry of values) {
+        const candidate = normalizeDoi(entry?.data?.value);
+        if (candidate) {
+            return candidate;
+        }
+    }
+
+    return null;
+}
+
+async function fetchJson(url) {
+    let response;
+    try {
+        response = await fetchWithRetry(url, {
+            redirect: "follow",
+            headers: {
+                "user-agent": "Mozilla/5.0 doi-pdf Downloader",
+                accept: "application/json,text/plain;q=0.9,*/*;q=0.8",
+            },
+        });
+    } catch (error) {
+        throw new Error(`Failed to fetch JSON ${url}`, { cause: error });
+    }
+
+    try {
+        return await response.json();
+    } catch (error) {
+        throw new Error(`Failed to parse JSON from ${response.url}`, { cause: error });
+    }
+}
+
+async function resolveCanonicalDoi(doi) {
+    const normalized = normalizeDoi(doi);
+    if (!normalized) {
+        return null;
+    }
+
+    try {
+        const payload = await fetchJson(`https://doi.org/api/handles/${encodeURIComponent(normalized)}`);
+        return extractCanonicalDoiFromHandleResponse(payload) || normalized;
+    } catch {
+        return normalized;
+    }
+}
+
+function deriveSpringerPdfUrls(baseUrl, expectedDoi, html) {
+    const doi = expectedDoi || extractDoiFromText(baseUrl) || extractDoiFromText(html);
+    if (!doi || !hostMatches(baseUrl, /(^|\.)link\.springer\.com$/i)) {
+        return [];
+    }
+
+    return [
+        `https://link.springer.com/content/pdf/${doi}.pdf`,
+        `https://link.springer.com/content/pdf/${doi}.pdf?download=1`,
+    ];
+}
+
+function extractCandidatePdfUrls(html, baseUrl, options = {}) {
     const candidates = [];
     const metaPatterns = [
         /<meta[^>]+name=["']citation_pdf_url["'][^>]+content=["']([^"']+)["']/ig,
         /<meta[^>]+content=["']([^"']+)["'][^>]+name=["']citation_pdf_url["']/ig,
+        /<link[^>]+type=["']application\/pdf["'][^>]+href=["']([^"']+)["']/ig,
+        /<link[^>]+href=["']([^"']+)["'][^>]+type=["']application\/pdf["']/ig,
+        /(?:data-pdf-url|pdfUrl|downloadPdfUrl)["'\s:=]+([^"'\\s>]+(?:\.pdf|\/pdf|download)[^"'\s>]*)/ig,
     ];
 
     for (const pattern of metaPatterns) {
         for (const match of html.matchAll(pattern)) {
-            const resolved = resolveUrl(match[1], baseUrl);
-            if (resolved) {
-                candidates.push(resolved);
-            }
+            appendUniqueUrl(candidates, match[1], baseUrl);
         }
     }
 
-    for (const match of html.matchAll(/<(a|iframe)[^>]+(?:href|src)=["']([^"']+)["'][^>]*>/ig)) {
-        const raw = match[2];
+    for (const match of html.matchAll(/<(a|iframe|embed|object)[^>]+(?:href|src|data)=["']([^"']+)["'][^>]*>/ig)) {
+        const raw = decodeHtmlEntities(match[2]);
         const lower = raw.toLowerCase();
         const looksPdf = lower.includes(".pdf") || lower.includes("/pdf") || lower.includes("download");
         if (!looksPdf) {
             continue;
         }
 
-        const resolved = resolveUrl(raw, baseUrl);
-        if (resolved) {
-            candidates.push(resolved);
-        }
+        appendUniqueUrl(candidates, raw, baseUrl);
     }
 
-    return [...new Set(candidates)];
+    for (const candidate of deriveSpringerPdfUrls(baseUrl, options.expectedDoi, html)) {
+        appendUniqueUrl(candidates, candidate, baseUrl);
+    }
+
+    return candidates;
+}
+
+function detectAccessIssue(text, url) {
+    const haystack = `${url}\n${text}`.toLowerCase();
+    const markers = [
+        "buy article",
+        "institutional access",
+        "access through your institution",
+        "access provided by",
+        "you do not have access",
+        "purchase this article",
+        "subscribe to this journal",
+        "subscription required",
+        "log in via an institution",
+        "access options",
+        "cookies_not_supported",
+        'name="access" content="no"',
+    ];
+
+    if (markers.some((marker) => haystack.includes(marker))) {
+        return "Publisher page does not expose a downloadable PDF for this session";
+    }
+
+    return null;
 }
 
 async function findPdfUrl(pageUrl, expectedDoi) {
@@ -379,48 +653,116 @@ async function findPdfUrl(pageUrl, expectedDoi) {
         return { pdfUrl: page.finalUrl, doi: expectedDoi || extractDoiFromText(page.finalUrl) };
     }
 
-    const candidates = extractCandidatePdfUrls(page.text, page.finalUrl);
+    const candidates = extractCandidatePdfUrls(page.text, page.finalUrl, { expectedDoi });
     if (candidates.length === 0) {
-        throw new Error("No PDF link found");
+        const accessIssue = detectAccessIssue(page.text, page.finalUrl);
+        throw new Error(accessIssue || `No PDF link found on ${page.finalUrl}`);
     }
 
     const doi = expectedDoi || extractDoiFromText(page.finalUrl) || extractDoiFromText(pageUrl) || extractDoiFromText(page.text);
     return { pdfUrl: candidates[0], doi };
 }
 
-async function downloadFile(fileUrl, outputPath) {
-    const response = await fetch(fileUrl, {
-        redirect: "follow",
-        headers: {
-            "user-agent": "Mozilla/5.0 doi-pdf Downloader",
-            accept: "application/pdf,*/*;q=0.8",
-        },
-    });
+function collectPageUrls(settings, doi) {
+    const candidates = [];
+    if (settings.source) {
+        candidates.push(buildPageUrl(settings.source, doi));
+    }
+    candidates.push(`https://doi.org/${encodeURIComponent(doi)}`);
+    return [...new Set(candidates)];
+}
 
-    if (!response.ok) {
-        throw new Error(`HTTP ${response.status}`);
+async function findPdfUrlWithFallback(settings, doi) {
+    const errors = [];
+
+    for (const pageUrl of collectPageUrls(settings, doi)) {
+        try {
+            return await findPdfUrl(pageUrl, doi);
+        } catch (error) {
+            errors.push({ pageUrl, error });
+        }
     }
 
-    const arrayBuffer = await response.arrayBuffer();
-    const buffer = Buffer.from(arrayBuffer);
-    if (!looksLikePdf(buffer)) {
-        throw new Error("Response is not a PDF");
+    const primary = errors[0];
+    if (!primary) {
+        throw new Error(`Unable to resolve a PDF URL for ${doi}`);
     }
 
-    await fs.promises.writeFile(outputPath, buffer);
-    return outputPath;
+    const details = errors
+        .slice(1)
+        .map(({ pageUrl, error }) => `${pageUrl} -> ${formatErrorMessage(error)}`)
+        .join("; ");
+    if (!details) {
+        throw primary.error;
+    }
+
+    throw new Error(`${formatErrorMessage(primary.error)}; fallback attempts: ${details}`);
+}
+
+async function downloadFile(fileUrl, outputPath, options = {}) {
+    const visited = options.visited || new Set();
+    const normalizedUrl = String(fileUrl || "");
+
+    if (visited.has(normalizedUrl)) {
+        throw new Error(`Redirect loop while resolving PDF: ${normalizedUrl}`);
+    }
+    visited.add(normalizedUrl);
+
+    let response;
+    try {
+        response = await fetchWithRetry(fileUrl, {
+            redirect: "follow",
+            headers: {
+                "user-agent": "Mozilla/5.0 doi-pdf Downloader",
+                accept: "application/pdf,*/*;q=0.8",
+            },
+        });
+    } catch (error) {
+        throw new Error(`Failed to fetch PDF ${fileUrl}`, { cause: error });
+    }
+
+    let buffer;
+    try {
+        const arrayBuffer = await response.arrayBuffer();
+        buffer = Buffer.from(arrayBuffer);
+    } catch (error) {
+        throw new Error(`Failed to read PDF response from ${response.url}`, { cause: error });
+    }
+
+    if (looksLikePdf(buffer)) {
+        await fs.promises.writeFile(outputPath, buffer);
+        return outputPath;
+    }
+
+    const contentType = (response.headers.get("content-type") || "").toLowerCase();
+    if (contentType.includes("text/html") || looksLikeHtml(buffer)) {
+        const html = buffer.toString("utf8");
+        const nestedCandidates = extractCandidatePdfUrls(html, response.url, { expectedDoi: options.expectedDoi });
+        const nextCandidate = nestedCandidates.find((candidate) => !visited.has(candidate));
+        if (nextCandidate) {
+            return downloadFile(nextCandidate, outputPath, {
+                ...options,
+                visited,
+            });
+        }
+
+        const accessIssue = detectAccessIssue(html, response.url);
+        throw new Error(accessIssue || `Response is HTML, not a PDF (${response.url})`);
+    }
+
+    throw new Error(`Response is not a PDF (${contentType || "unknown content-type"})`);
 }
 
 async function downloadFromDoi(input, settings) {
-    const doi = normalizeDoi(input);
+    const normalizedInput = normalizeDoi(input);
+    const doi = await resolveCanonicalDoi(normalizedInput);
     if (!doi) {
         throw new Error("Invalid DOI");
     }
 
-    const pageUrl = buildPageUrl(settings.source, doi);
-    const { pdfUrl, doi: resolvedDoi = doi } = await findPdfUrl(pageUrl, doi);
+    const { pdfUrl, doi: resolvedDoi = doi } = await findPdfUrlWithFallback(settings, doi);
     const outputPath = path.join(settings.outputDir, filenameForDoi(resolvedDoi));
-    await downloadFile(pdfUrl, outputPath);
+    await downloadFile(pdfUrl, outputPath, { expectedDoi: resolvedDoi });
     return { doi: resolvedDoi, pdfUrl, outputPath };
 }
 
@@ -474,6 +816,81 @@ function gatherDoiInputs(argvDois, stdinText) {
     return [...argvDois, ...stdinDois];
 }
 
+function tryParseJson(value) {
+    try {
+        return JSON.parse(value);
+    } catch {
+        return null;
+    }
+}
+
+function parseJsonLines(value) {
+    const items = [];
+    for (const line of String(value || "").split(/\r?\n/)) {
+        const trimmed = line.trim();
+        if (!trimmed) {
+            continue;
+        }
+
+        const parsed = tryParseJson(trimmed);
+        if (parsed !== null) {
+            items.push(parsed);
+        }
+    }
+    return items;
+}
+
+function normalizeItemList(value) {
+    if (Array.isArray(value)) {
+        return value;
+    }
+
+    if (value && typeof value === "object") {
+        return [value];
+    }
+
+    return [];
+}
+
+function parseItemsInput(text, label) {
+    const trimmed = String(text || "").trim();
+    if (!trimmed) {
+        return [];
+    }
+
+    const asJson = tryParseJson(trimmed);
+    if (asJson !== null) {
+        return normalizeItemList(asJson);
+    }
+
+    const asJsonLines = parseJsonLines(trimmed);
+    if (asJsonLines.length > 0) {
+        return asJsonLines;
+    }
+
+    throw new Error(`Failed to parse item JSON from ${label}`);
+}
+
+async function readItemsFile(itemsPath) {
+    if (!itemsPath) {
+        return [];
+    }
+
+    const resolved = path.resolve(itemsPath);
+    const raw = await fs.promises.readFile(resolved, "utf8");
+    return parseItemsInput(raw, resolved);
+}
+
+function gatherItemInputs(itemObjects) {
+    return itemObjects
+        .map((item) => extractDoiFromItem(item))
+        .filter(Boolean);
+}
+
+function unique(items) {
+    return [...new Set(items)];
+}
+
 function printResolvedConfig(settings, configPath) {
     console.log(
         JSON.stringify(
@@ -522,7 +939,14 @@ async function main() {
     }
 
     const stdinText = await readStdin();
-    const doiInputs = gatherDoiInputs(cliOptions.dois, stdinText);
+    const fileItems = await readItemsFile(cliOptions.itemsPath);
+    const stdinItems = cliOptions.stdinJson ? parseItemsInput(stdinText, "stdin") : [];
+    const doiInputs = unique([
+        ...cliOptions.dois,
+        ...gatherItemInputs(fileItems),
+        ...gatherItemInputs(stdinItems),
+        ...(cliOptions.stdinJson ? [] : gatherDoiInputs([], stdinText)),
+    ]);
 
     if (doiInputs.length === 0) {
         fail("Usage: ./doi-pdf [options] <doi> [doi ...]");
@@ -544,7 +968,7 @@ async function main() {
         }
 
         const rawInput = doiInputs[index];
-        const message = result?.error?.message || "Unknown error";
+        const message = formatErrorMessage(result?.error);
         console.error(`Skipped ${rawInput}: ${message}`);
     });
 

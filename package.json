@@ -1,6 +1,6 @@
 {
   "name": "crossref-cli-tools",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Lightweight Node-based Crossref CLIs for DOI lookup, metadata retrieval, CSL rendering, and PDF download",
   "license": "UNLICENSED",
   "homepage": "https://github.com/iihciyekub/crossref-cli-tools#readme",

@@ -1,55 +1,43 @@
-# crossrefCLI
+# crossref-cli-tools
 
-面向 Crossref 的轻量命令行工具集。
+面向 Crossref / DOI 工作流的轻量 Node.js 命令行工具集。
 
-GitHub:
+仓库地址：
 
 - [iihciyekub/crossref-cli-tools](https://github.com/iihciyekub/crossref-cli-tools)
 
-项目现在稳定分成四条链路：
+当前包含四个 CLI：
 
 - `crossref-stq`
   参考文献文本 -> DOI
 - `crossref-doi`
-  DOI -> 格式化文本 / 元数据 / 批量导出文件
+  DOI -> 格式化文献 / 元数据 / 批量导出
 - `crossref-csl`
   DOI -> citation / bibliography / HTML
 - `doi-pdf`
-  DOI -> 按可配置下载源抓取 PDF
+  DOI / DOI URL / Zotero 风格条目 JSON -> PDF 下载
 
-设计原则：
+## 特点
 
-- 尽量轻
-- 默认可直接在终端使用
-- 需要保存结果时再显式加文件输出参数
-- 不引入重型框架
-
-## 目录结构
-
-- [crossref-stq](/Users/iipro/iiworkspace/crossrefCLI/crossref-stq)
-- [crossref-doi](/Users/iipro/iiworkspace/crossrefCLI/crossref-doi)
-- [crossref-csl](/Users/iipro/iiworkspace/crossrefCLI/crossref-csl)
-- [doi-pdf](/Users/iipro/iiworkspace/crossrefCLI/doi-pdf)
-- [install.sh](/Users/iipro/iiworkspace/crossrefCLI/install.sh)
-- [check](/Users/iipro/iiworkspace/crossrefCLI/check)
-- [README.md](/Users/iipro/iiworkspace/crossrefCLI/README.md)
+- 纯 Node.js，依赖轻
+- 可直接在终端运行
+- 支持单条输入、批量输入、标准输入
+- `doi-pdf` 支持 DOI 规范化、官方 DOI 回退、Zotero 风格条目 JSON
 
 ## 依赖
 
-四个 CLI 现在都基于 Node：
-
-- `node`
+- `node >= 18`
 - `npm`
 
 ## 安装
 
-推荐全局安装：
+全局安装：
 
 ```bash
 npm install -g crossref-cli-tools
 ```
 
-安装后可直接在任意目录使用：
+安装后可直接使用：
 
 ```bash
 crossref-stq --help
@@ -58,106 +46,69 @@ crossref-csl --help
 doi-pdf --help
 ```
 
-从 GitHub 下载并本地全局链接：
+本地开发：
 
 ```bash
 git clone https://github.com/iihciyekub/crossref-cli-tools.git
 cd crossref-cli-tools
 npm install
-npm link
 ```
 
-只在当前仓库里本地运行：
+如果只想在当前仓库目录里直接运行：
 
 ```bash
-git clone https://github.com/iihciyekub/crossref-cli-tools.git
-cd crossref-cli-tools
-npm install
-./crossref-doi 10.1126/science.1157784
+./crossref-stq --help
+./crossref-doi --help
+./crossref-csl --help
+./doi-pdf --help
 ```
 
-如果你更偏向本地脚本链接，也可以用：
+如果你偏向本地脚本链接，也可以运行：
 
 ```bash
 ./install.sh
 ```
 
-默认会把命令链接到：
-
-```text
-~/.local/bin
-```
-
-如果这个目录还没在 `PATH` 里，安装脚本会提示你加上。
-
-给脚本执行权限：
-
-```bash
-chmod +x ./crossref-stq ./crossref-doi ./crossref-csl ./doi-pdf ./install.sh ./check
-```
-
 ## 快速开始
 
-文本参考文献转 DOI：
+参考文献文本转 DOI：
 
 ```bash
 ./crossref-stq refs.txt
+./crossref-stq --text "Boucher RC (2004) New concepts of the pathogenesis of cystic fibrosis lung disease. Eur Resp J 23: 146-158."
 ```
 
 DOI 转格式化参考文献：
 
 ```bash
 ./crossref-doi 10.1126/science.1157784
+./crossref-doi 10.1126/science.1157784 --style ieee
+./crossref-doi 10.1126/science.1157784 --format ris
 ```
 
-DOI 渲染 bibliography：
+DOI 渲染 citation / bibliography：
 
 ```bash
 ./crossref-csl bibliography 10.1126/science.1157784
+./crossref-csl citation 10.1126/science.1157784 --style apa --locator "12"
 ```
 
-配置下载源后按 DOI 下载 PDF：
+按 DOI 下载 PDF：
 
 ```bash
-./doi-pdf --source 'https://example.org/{doi}' 10.1126/science.1157784
+./doi-pdf 10.1126/science.1157784
+./doi-pdf https://doi.org/10.1007/s11423-017-9556-8
+printf '%s\n' 10.1126/science.1157784 10.1038/nphys1170 | ./doi-pdf
 ```
 
-第一次初始化全局配置：
+用 Zotero 风格条目 JSON 下载 PDF：
 
 ```bash
-./doi-pdf --init-config --source 'https://example.org/{doi}'
+./doi-pdf --items zotero-items.json
+cat zotero-items.jsonl | ./doi-pdf --stdin-json
 ```
 
-串联使用：
-
-```bash
-./crossref-stq refs.txt | ./crossref-csl bibliography --style apa
-```
-
-安装完成后也可以在任意目录直接调用：
-
-```bash
-crossref-doi 10.1126/science.1157784
-doi-pdf --print-config
-```
-
-## 发布准备
-
-当前 npm 包名 `crossref-cli-tools` 还没有被占用。GitHub 仓库已经创建好：
-
-- [iihciyekub/crossref-cli-tools](https://github.com/iihciyekub/crossref-cli-tools)
-
-正式发布到 npm 之前还需要你自己完成一件事：
-
-- 用你的 npm 账号执行 `npm login`，然后运行 `npm publish`
-
-发布前可先检查打包内容：
-
-```bash
-npm pack --dry-run
-```
-
-## 命令概览
+## 命令说明
 
 ### `crossref-stq`
 
@@ -165,55 +116,25 @@ npm pack --dry-run
 
 - 输入一条或多条参考文献文本
 - 调用 Crossref Simple Text Query
-- 返回匹配到的 DOI
+- 输出匹配 DOI
 
-最常用：
+常见示例：
 
 ```bash
 ./crossref-stq refs.txt
 ./crossref-stq --text "citation text"
 cat refs.txt | ./crossref-stq --stdin
-```
-
-默认输出：
-
-- 只打印 DOI
-- 一行一个 DOI
-
-其它模式：
-
-```bash
 ./crossref-stq refs.txt --verbose
 ./crossref-stq refs.txt --json
-./crossref-stq refs.txt --include-pm --verbose
-./crossref-stq refs.txt --multi-hit --verbose
 ```
-
-帮助：
-
-```bash
-./crossref-stq --help
-./crossref-stq --version
-```
-
-输入约束：
-
-- 一行一条参考文献
-- 单条参考文献内部不要换行
-- 单条和多条都自动支持
-
-相关站点：
-
-- [Simple Text Query](https://apps.crossref.org/SimpleTextQuery)
-- [SimpleTextQuery.js](https://apps.crossref.org/SimpleTextQuery.js)
 
 ### `crossref-doi`
 
 用途：
 
 - 输入一个或多个 DOI
-- 通过 Crossref content negotiation 或 REST API 获取结果
-- 输出到终端，或按 DOI 分别保存到目录
+- 通过 DOI content negotiation 或 Crossref REST API 获取结果
+- 输出到终端或保存到目录
 
 支持格式：
 
@@ -225,181 +146,65 @@ cat refs.txt | ./crossref-stq --stdin
 - `unixref`
 - `unixsd`
 
-最常用：
+常见示例：
 
 ```bash
 ./crossref-doi 10.1126/science.1157784
-./crossref-doi 10.1126/science.1157784 --style ieee
-./crossref-doi 10.1126/science.1157784 --format ris
 ./crossref-doi 10.1126/science.1157784 --format bibtex
-./crossref-doi 10.1126/science.1157784 --format csljson
-./crossref-doi 10.1126/science.1157784 --format json
-```
-
-多 DOI：
-
-```bash
-./crossref-doi 10.1126/science.1157784 10.1038/nphys1170
-./crossref-doi --doi 10.1126/science.1157784 --doi 10.1038/nphys1170
-printf '%s\n' 10.1126/science.1157784 10.1038/nphys1170 | ./crossref-doi
-```
-
-批量保存文件：
-
-```bash
 ./crossref-doi 10.1126/science.1157784 10.1038/nphys1170 --format ris --out out/
+printf '%s\n' 10.1126/science.1157784 10.1038/nphys1170 | ./crossref-doi --format text
 ```
-
-会生成类似：
-
-```text
-out/10.1126_science.1157784.ris
-out/10.1038_nphys1170.ris
-```
-
-样式查看：
-
-```bash
-./crossref-doi --list-styles
-./crossref-doi --search-style apa
-./crossref-doi --show-styles 20
-```
-
-帮助：
-
-```bash
-./crossref-doi --help
-./crossref-doi --version
-```
-
-说明：
-
-- `--style` 和 `--locale` 只对 `--format text` 生效
-- `RIS` 一般可直接导入 EndNote
-- 多 DOI 模式内部按顺序逐个请求，不做并发
-- 多 DOI 时，`json` 和 `csljson` 输出 JSON 数组
-- `--out DIR` 模式下，结果主体不再打印到 stdout，而是在 `DIR` 中一条 DOI 一个文件
-- 样式名拼错时，会给出候选建议
-
-官方文档：
-
-- [Retrieve metadata](https://www.crossref.org/documentation/retrieve-metadata/)
-- [Content negotiation](https://www.crossref.org/documentation/retrieve-metadata/content-negotiation/)
-- [REST API](https://www.crossref.org/documentation/retrieve-metadata/rest-api/)
-- [Styles list](https://api.crossref.org/v1/styles)
 
 ### `crossref-csl`
 
 用途：
 
-- 输入一个或多个 DOI
-- 获取 DOI 对应的 CSL JSON
-- 使用 `citeproc-js` 渲染
-- 输出 `citation` 或 `bibliography`
-- 支持 `text` 和 `html`
+- 输入 DOI
+- 拉取 CSL JSON
+- 通过 `citeproc-js` 渲染文中引用或参考文献
 
-两种模式：
+支持模式：
 
-- `bibliography`
 - `citation`
+- `bibliography`
 
-最常用：
+常见示例：
 
 ```bash
 ./crossref-csl bibliography 10.1126/science.1157784
-./crossref-csl citation 10.1126/science.1157784
-./crossref-csl bibliography 10.1126/science.1157784 --output html
-./crossref-csl bibliography 10.1126/science.1157784 --style ieee
-```
-
-多 DOI：
-
-```bash
-./crossref-csl bibliography 10.1126/science.1157784 10.1038/nphys1170
-./crossref-csl citation 10.1126/science.1157784 10.1038/nphys1170 --style ieee
-printf '%s\n' 10.1126/science.1157784 10.1038/nphys1170 | ./crossref-csl bibliography
-```
-
-文中引用细节：
-
-```bash
-./crossref-csl citation 10.1126/science.1157784 --style apa --locator "12"
-./crossref-csl citation 10.1126/science.1157784 --style apa --prefix "see"
-./crossref-csl citation 10.1126/science.1157784 --style apa --prefix "see" --locator "12" --suffix "for discussion"
-```
-
-示例输出可能类似：
-
-```text
-(Renear & Palmer, 2009)
-(see Renear & Palmer, 2009, p. 12 for discussion)
-```
-
-保存渲染结果到文件：
-
-```bash
+./crossref-csl citation 10.1126/science.1157784 --style apa
 ./crossref-csl bibliography 10.1126/science.1157784 --output html --out out/bibliography.html
-./crossref-csl citation 10.1126/science.1157784 --style apa --out out/citation.txt
 ```
-
-使用本地样式文件：
-
-```bash
-./crossref-csl bibliography 10.1126/science.1157784 --style-file /path/to/custom.csl
-```
-
-样式查看：
-
-```bash
-./crossref-csl --list-styles
-./crossref-csl --search-style chicago
-./crossref-csl --show-styles 20
-```
-
-帮助：
-
-```bash
-./crossref-csl --help
-./crossref-csl --version
-```
-
-说明：
-
-- 默认样式是 `apa`
-- 默认 locale 是 `en-US`
-- `--prefix`、`--suffix`、`--locator` 只对 `citation` 模式生效
-- `--out FILE` 模式下，结果主体不再打印到 stdout，而是写入文件
-- 当前 `citation` 模式是单个 citation cluster
-- 还没有实现整篇文档上下文连续引用状态管理
-- 样式、locale、DOI 对应的 CSL JSON 会缓存到本地
-- 样式名拼错时，会给出候选建议
 
 ### `doi-pdf`
 
 用途：
 
-- 输入一个或多个 DOI
-- 访问你配置的下载源
-- 从页面里查找 PDF 链接并保存到目录
-- 最终在 stdout 输出成功下载的 DOI JSON 数组
+- 输入 DOI、DOI URL，或 Zotero 风格条目 JSON
+- 先规范化 DOI，再尝试下载 PDF
+- 成功时把 PDF 保存到输出目录，并在 `stdout` 打印成功 DOI JSON 数组
 
-最常用：
+输入支持：
 
-```bash
-./doi-pdf --source 'https://example.org/{doi}' 10.1126/science.1157784
-./doi-pdf --source 'https://example.org/{doi_encoded}' 10.1126/science.1157784
-printf '%s\n' 10.1126/science.1157784 10.1038/nphys1170 | ./doi-pdf --source 'https://example.org/'
-```
+- 标准 DOI
+- `https://doi.org/...` 或 `doi:...`
+- Zotero 风格 JSON 对象
+- Zotero 风格 JSON 数组
+- JSON Lines
 
-批量下载和并发：
+Zotero 风格条目里的 DOI 提取顺序：
 
-```bash
-./doi-pdf --source 'https://example.org/{doi}' 10.1126/science.1157784 10.1038/nphys1170
-./doi-pdf --source 'https://example.org/{doi}' --concurrency 2 10.1126/science.1157784 10.1038/nphys1170
-printf '%s\n' 10.1126/science.1157784 10.1038/nphys1170 | ./doi-pdf --source 'https://example.org/{doi}'
-```
+- `DOI` / `doi`
+- `extra` 中的 `DOI: ...`
+- `url` 中的 `doi.org/...`
 
-配置文件：
+下载逻辑：
+
+- 优先使用你配置的 `source`
+- 如果失败，自动回退到 `doi.org/{doi}`
+- 支持从 HTML 中提取 `citation_pdf_url`、`application/pdf` 链接，以及常见 `a` / `iframe` / `embed` / `object` PDF 链接
+
+配置示例：
 
 ```json
 {
@@ -409,69 +214,22 @@ printf '%s\n' 10.1126/science.1157784 10.1038/nphys1170 | ./doi-pdf --source 'ht
 }
 ```
 
-默认配置文件路径：
-
-```text
-~/.config/crossref-cli/doi-pdf.json
-```
-
-第一次安装时最简单的方式：
+初始化全局配置：
 
 ```bash
 ./doi-pdf --init-config --source 'https://example.org/{doi}'
 ./doi-pdf --print-config
 ```
 
-这会把配置写到：
-
-```text
-~/.config/crossref-cli/doi-pdf.json
-```
-
-如果后面想重写这份配置：
+更多示例：
 
 ```bash
-./doi-pdf --init-config --source 'https://example.org/{doi}' --force
+./doi-pdf --source 'https://example.org/{doi}' 10.1126/science.1157784
+./doi-pdf --source 'https://example.org/{doi_encoded}' 10.1126/science.1157784
+./doi-pdf --out out/papers --concurrency 2 10.1126/science.1157784 10.1038/nphys1170
+./doi-pdf --items zotero-items.json
+cat zotero-items.jsonl | ./doi-pdf --stdin-json
 ```
-
-也可以显式指定：
-
-```bash
-./doi-pdf --config /path/to/doi-pdf.json 10.1126/science.1157784
-./doi-pdf --print-config
-```
-
-输出目录和并发：
-
-```bash
-./doi-pdf --source 'https://example.org/{doi}' --out out/papers --concurrency 2 10.1126/science.1157784
-```
-
-帮助：
-
-```bash
-./doi-pdf --help
-./doi-pdf --version
-```
-
-说明：
-
-- 不内置默认下载源，必须通过 `--source`、环境变量或配置文件提供
-- `--init-config` 必须显式传 `--source`，然后才会创建全局配置文件
-- 如果配置文件已存在，可配合 `--force` 覆盖
-- `source` 可以是基地址，也可以是带 `{doi}` / `{doi_encoded}` 的 URL 模板
-- 如果 `source` 不含占位符，行为就是 `source + DOI`
-- 默认输出目录是当前目录下的 `papers`
-- 默认并发是 `3`，最大也是 `3`
-- 支持多个 DOI 批量下载，既可以作为位置参数传入，也可以从 `stdin` 读入
-- 内部使用小并发队列处理批量下载，不会一次性把所有 DOI 全部并发发出
-- 如果输入 50 个 DOI，最多同时跑 `3` 个下载任务，完成一个再补下一个
-- 下载源返回的内容需要满足以下任一条件：
-  - 直接返回 PDF
-  - HTML 中包含 `citation_pdf_url`
-  - HTML 中存在指向 PDF / download 的 `a` 或 `iframe`
-- `stderr` 会打印下载成功或跳过原因
-- `stdout` 只打印成功 DOI 的 JSON 数组
 
 ## 常见工作流
 
@@ -488,30 +246,21 @@ printf '%s\n' 10.1126/science.1157784 10.1038/nphys1170 | ./doi-pdf --source 'ht
 ./crossref-doi 10.1126/science.1157784 --format bibtex
 ```
 
-通过 DOI 直接生成正文引用：
+直接从 DOI 下载 PDF：
 
 ```bash
-./crossref-csl citation 10.1126/science.1157784 --style apa
-./crossref-csl citation 10.1126/science.1157784 --style ieee --locator "12"
+./doi-pdf 10.1126/science.1157784
 ```
 
-导出 HTML bibliography：
+从 Zotero 导出的条目 JSON 批量下载 PDF：
 
 ```bash
-./crossref-csl bibliography 10.1126/science.1157784 --output html --out out/bibliography.html
+./doi-pdf --items items.json
 ```
 
-通过可配置下载源批量抓 PDF：
+## 环境变量
 
-```bash
-printf '%s\n' 10.1126/science.1157784 10.1038/nphys1170 | ./doi-pdf --source 'https://example.org/{doi}' --out out/papers
-```
-
-## 网络与缓存配置
-
-为了保持脚本简单，项目统一采用少量环境变量。
-
-所有 Node CLI 都可用：
+所有 Node CLI 通用：
 
 - `CROSSREFCLI_RETRIES`
   请求重试次数，默认 `2`
@@ -520,38 +269,24 @@ printf '%s\n' 10.1126/science.1157784 10.1038/nphys1170 | ./doi-pdf --source 'ht
 - `CROSSREFCLI_FETCH_TIMEOUT_MS`
   单次请求超时毫秒数，默认跟随 `CROSSREFCLI_MAX_TIME`
 
-部分命令额外可用：
+`doi-pdf` 额外支持：
 
-- `CROSSREFCLI_CACHE_DIR`
-  缓存目录
 - `DOI2PDF_SOURCE_URL`
-  `doi-pdf` 的下载源
 - `DOI2PDF_BASE_URL`
   `DOI2PDF_SOURCE_URL` 的兼容别名
 - `DOI2PDF_OUTPUT_DIR`
-  `doi-pdf` 输出目录
 - `DOI2PDF_MAX_CONCURRENCY`
-  `doi-pdf` 并发数
 - `DOI2PDF_CONFIG`
-  `doi-pdf` 配置文件路径
 
 示例：
 
 ```bash
 export CROSSREFCLI_RETRIES=3
-export CROSSREFCLI_CONNECT_TIMEOUT=10
 export CROSSREFCLI_MAX_TIME=60
 export CROSSREFCLI_FETCH_TIMEOUT_MS=60000
-export CROSSREFCLI_CACHE_DIR="$HOME/.cache/crossref-cli"
 export DOI2PDF_SOURCE_URL='https://example.org/{doi}'
 export DOI2PDF_OUTPUT_DIR='papers'
 export DOI2PDF_MAX_CONCURRENCY=2
-```
-
-默认缓存目录：
-
-```text
-~/.cache/crossref-cli
 ```
 
 ## 检查
@@ -562,19 +297,35 @@ export DOI2PDF_MAX_CONCURRENCY=2
 ./check
 ```
 
-它会检查：
+如果你刚 clone 下来，需要先安装依赖：
 
-- 四个 CLI 的 `--help`
-- 四个 CLI 的 `--version`
-- `crossref-stq` 是否能返回 DOI
-- `crossref-doi` 是否能返回格式化文本
-- `crossref-doi` 是否能处理多 DOI
-- `crossref-doi` 是否能输出文件
-- `crossref-csl` 是否能返回 citation
-- `crossref-csl` 是否能处理 citation 细节参数
-- `crossref-csl` 是否能返回 bibliography
-- `crossref-csl` 是否能输出文件
-- `doi-pdf` 是否能解析帮助和配置输出
+```bash
+npm install
+./check
+```
+
+## 发布
+
+更新版本号：
+
+```bash
+npm version patch
+```
+
+预览打包内容：
+
+```bash
+npm pack --dry-run
+```
+
+发布到 npm：
+
+```bash
+npm login
+npm publish
+```
+
+发布 GitHub 版本后，你也可以再创建对应 tag / release。
 
 ## 什么时候用哪个命令
 
@@ -582,14 +333,14 @@ export DOI2PDF_MAX_CONCURRENCY=2
 
 - 用 `crossref-stq`
 
-如果你已经有 DOI，只想拿官方返回格式：
+如果你已经有 DOI，只想拿官方格式化结果或元数据：
 
 - 用 `crossref-doi`
 
-如果你已经有 DOI，需要 citation / bibliography / HTML 渲染：
+如果你已经有 DOI，需要 citation / bibliography / HTML：
 
 - 用 `crossref-csl`
 
-如果你已经有 DOI，并且想通过自定义下载源抓 PDF：
+如果你已经有 DOI、DOI URL，或者 Zotero 风格条目 JSON，并且想下载 PDF：
 
 - 用 `doi-pdf`

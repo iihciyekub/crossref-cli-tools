@@ -1,2 +1,4 @@
 node_modules/
 citeproc-*.tgz
+papers/
+crossref-cli-tools-*.tgz
